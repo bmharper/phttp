@@ -45,16 +45,28 @@ int main(int argc, char** argv) {
 		if (r.Path == "/") {
 			w.SetHeader("Content-Type", "text/html");
 			w.Body = "<!DOCTYPE HTML>\n<head><link rel='stylesheet' href='a.css'></head><body>Hello phttp!</body>";
+			// fetch heavy payload
+			w.Body += "<script>x = new XMLHttpRequest(); x.open('GET', '/heavy'); x.send();</script>";
 		} else if (r.Path == "/a.css") {
 			w.SetHeader("Content-Type", "text/css");
 			w.Body = "body { color: #0a0 }";
+		} else if (r.Path == "/heavy") {
+			// Send 32 MB payload
+			w.SetHeader("Content-Type", "text/plain");
+			w.Body = "12345678901234567890123456789012"; // 32 bytes
+			for (int i = 0; i < 20; i++)
+				w.Body += w.Body;
 		} else {
-			w.Body = "Unknown path: " + r.Path;
+			w.Body += "Unknown path: " + r.Path + "\n";
+			w.Body += "Query:\n";
+			for (auto p : r.Query)
+				w.Body += "" + p.first + ":" + p.second + "\n";
 		}
 	};
 
 	phttp::Server server;
-	SingleServer = &server;
+	server.LogAllEvents = true;
+	SingleServer        = &server;
 	server.ListenAndRun("127.0.0.1", 8080, handler);
 
 	phttp::Shutdown();

@@ -18,18 +18,12 @@
 namespace phttp {
 
 #ifdef _WIN32
-static const uint32_t Infinite            = INFINITE;
-static const int      ErrWOULDBLOCK       = WSAEWOULDBLOCK;
-static const int      ErrTIMEOUT          = WSAETIMEDOUT;
-static const int      ErrSEND_BUFFER_FULL = WSAENOBUFS; // untested
-static const int      ErrSOCKET_ERROR     = SOCKET_ERROR;
+static const uint32_t Infinite        = INFINITE;
+static const int      ErrSOCKET_ERROR = SOCKET_ERROR;
 #else
-static const uint32_t Infinite            = 0xFFFFFFFF;
-static const int      ErrWOULDBLOCK       = EWOULDBLOCK;
-static const int      ErrTIMEOUT          = ETIMEDOUT;
-static const int      ErrSEND_BUFFER_FULL = EMSGSIZE; // untested
-static const int      ErrSOCKET_ERROR     = -1;
-#define closesocket close
+static const uint32_t Infinite        = 0xFFFFFFFF;
+static const int      ErrSOCKET_ERROR = -1;
+inline int            closesocket(int fd) { return close(fd); }
 #endif
 
 #ifdef max
@@ -315,7 +309,8 @@ bool Server::ReadFromRequest(BusyReq* r) {
 		fprintf(Log, "[%5lld %5d] recv error %d %d. closing socket\n", (long long) r->ID, (int) r->Sock, nread, LastError());
 		return false;
 	} else if (nread == 0) {
-		fprintf(Log, "[%5lld %5d] socket closed on recv\n", (long long) r->ID, (int) r->Sock);
+		if (LogAllEvents)
+			fprintf(Log, "[%5lld %5d] socket closed on recv\n", (long long) r->ID, (int) r->Sock);
 		return false;
 	}
 
@@ -339,13 +334,13 @@ bool Server::ReadFromRequest(BusyReq* r) {
 		ok = DispatchToHandler(r);
 		if (ok) {
 			// Reset the parser for another request
-			auto oldID = r->ID;
+			auto oldID      = r->ID;
 			r->IsHeaderDone = false;
-			auto parser = (http_parser*) r->Parser;
+			auto parser     = (http_parser*) r->Parser;
 			http_parser_init(parser);
 			delete r->Req;
 			r->Req = new Request();
-			r->ID = NextReqID++;
+			r->ID  = NextReqID++;
 			if (LogAllEvents)
 				fprintf(Log, "[%5lld %5d] recycling socket (ID %lld) for another request\n", (long long) r->ID, (int) r->Sock, oldID);
 		}
@@ -355,9 +350,16 @@ bool Server::ReadFromRequest(BusyReq* r) {
 }
 
 bool Server::DispatchToHandler(BusyReq* r) {
-	char     linebuf[4096];
+	if (!ParsePath(r->Req))
+		fprintf(Log, "[%5lld %5d] path parse failed: '%s'\n", (long long) r->ID, (int) r->Sock, r->Req->RawPath.c_str());
+
+	if (!ParseQuery(r->Req))
+		fprintf(Log, "[%5lld %5d] query parse failed: '%s'\n", (long long) r->ID, (int) r->Sock, r->Req->RawQuery.c_str());
+
+	// Call the user-provided handler
 	Response w;
 	Handler(w, *r->Req);
+
 	if (w.Status == 0) {
 		if (w.Body.size() == 0) {
 			w.Status = Status500_Internal_Server_Error;
@@ -367,6 +369,8 @@ bool Server::DispatchToHandler(BusyReq* r) {
 			w.Status = Status200_OK;
 		}
 	}
+
+	char linebuf[4096];
 	if (w.Body.size() != 0) {
 		sprintf(linebuf, "%llu", (unsigned long long) w.Body.size());
 		w.SetHeader("Content-Length", linebuf);
@@ -422,6 +426,71 @@ bool Server::SendBuffer(BusyReq* r, const char* buf, size_t len) {
 	return true;
 }
 
+// returns -1 on error
+inline char HexToInt(char h) {
+	if (h >= 'a' && h <= 'f')
+		return 10 + h - 'a';
+	if (h >= 'A' && h <= 'F')
+		return 10 + h - 'A';
+	if (h >= '0' && h <= '9')
+		return h - '0';
+	return -1;
+}
+
+bool Server::ParsePath(Request* r) {
+	const char* s   = r->RawPath.c_str();
+	size_t      len = r->RawPath.size();
+	for (size_t i = 0; i < len; i++) {
+		char c = s[i];
+		if (c == '%') {
+			if (i >= len + 2)
+				return false;
+			c = (HexToInt(s[i + 1]) << 4) | HexToInt(s[i + 2]);
+			i += 2;
+		}
+		r->Path += c;
+	}
+	return true;
+}
+
+bool Server::ParseQuery(Request* r) {
+	using namespace std;
+	enum { Key,
+		   Value } state = Key;
+
+	const char*          s   = r->RawQuery.c_str();
+	size_t               len = r->RawQuery.size();
+	pair<string, string> current;
+	for (size_t i = 0; i < len; i++) {
+		char c       = s[i];
+		bool escaped = false;
+		if (c == '%') {
+			escaped = true;
+			if (i >= len + 2)
+				return false;
+			c = (HexToInt(s[i + 1]) << 4) | HexToInt(s[i + 2]);
+			i += 2;
+		}
+
+		if (!escaped && state == Key && c == '=') {
+			state = Value;
+			continue;
+		} else if (!escaped && state == Value && c == '&') {
+			r->Query.emplace_back(std::move(current));
+			state = Key;
+			continue;
+		}
+
+		if (state == Key)
+			current.first += c;
+		else
+			current.second += c;
+	}
+	if (current.first.size() != 0 || current.second.size() != 0)
+		r->Query.emplace_back(current);
+	return true;
+}
+
 void Server::CloseRequest(BusyReq* r) {
 	if (LogAllEvents)
 		fprintf(Log, "[%5lld %5d] socket closing\n", (long long) r->ID, (int) r->Sock);
@@ -446,6 +515,14 @@ void Server::Cleanup() {
 			fprintf(Log, "[%d] closesocket(ListenSock) failed: %d\n", (int) ListenSock, LastError());
 	}
 	ListenSock = InvalidSocket;
+
+	for (size_t i = 0; i < Requests.size(); i++) {
+		delete Requests[i]->Req;
+		delete (http_parser*) Requests[i]->Parser;
+		delete Requests[i];
+	}
+	Requests.clear();
+
 	free(Buf);
 	Buf     = nullptr;
 	BufSize = 0;
@@ -476,12 +553,12 @@ void Server::cb_fragment(void* data, const char* at, size_t length) {
 
 void Server::cb_request_path(void* data, const char* at, size_t length) {
 	BusyReq* r = (BusyReq*) data;
-	r->Req->Path.assign(at, length);
+	r->Req->RawPath.assign(at, length);
 }
 
 void Server::cb_query_string(void* data, const char* at, size_t length) {
 	BusyReq* r = (BusyReq*) data;
-	r->Req->QueryString.assign(at, length);
+	r->Req->RawQuery.assign(at, length);
 }
 
 void Server::cb_http_version(void* data, const char* at, size_t length) {

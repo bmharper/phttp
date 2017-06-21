@@ -105,9 +105,11 @@ public:
 	std::vector<std::pair<std::string, std::string>> Headers;
 	std::string                                      Method;
 	std::string                                      URI;
-	std::string                                      Path;
+	std::string                                      RawPath; // Path before performing URL unescaping
+	std::string                                      Path;    // Path with URL unescaping (ie %20 -> 32)
 	std::string                                      Fragment;
-	std::string                                      QueryString;
+	std::string                                      RawQuery;
+	std::vector<std::pair<std::string, std::string>> Query; // Parse key+value pairs from QueryString
 	std::string                                      Body;
 
 	std::string Header(const char* h) const;
@@ -143,7 +145,7 @@ public:
 	};
 
 	FILE*             Log          = nullptr;
-	bool              LogAllEvents = true; // If enabled, all socket events are logged
+	bool              LogAllEvents = false; // If enabled, all socket events are logged
 	std::atomic<bool> StopSignal;
 
 	bool ListenAndRun(const char* bindAddress, int port, std::function<void(Response& w, Request& r)> handler);
@@ -165,6 +167,8 @@ private:
 	bool ReadFromRequest(BusyReq* r); // Returns false if we must close the socket
 	bool DispatchToHandler(BusyReq* r);
 	bool SendBuffer(BusyReq* r, const char* buf, size_t len);
+	bool ParsePath(Request* r);
+	bool ParseQuery(Request* r);
 
 	// http_parser callbacks
 	static void cb_http_field(void* data, const char* field, size_t flen, const char* value, size_t vlen);
