@@ -201,7 +201,7 @@ bool Server::ListenAndRun(const char* bindAddress, int port, std::function<void(
 		return false;
 	}
 
-	sockaddr_in service;
+	sockaddr_in service = {0};
 	service.sin_family = AF_INET;
 	inet_pton(AF_INET, bindAddress, &service.sin_addr);
 	service.sin_port = htons(port);
@@ -209,11 +209,13 @@ bool Server::ListenAndRun(const char* bindAddress, int port, std::function<void(
 	int err = ::bind(ListenSock, (sockaddr*) &service, sizeof(service));
 	if (err == ErrSOCKET_ERROR) {
 		fprintf(Log, "bind() on %s:%d failed: %d\n", bindAddress, port, LastError());
+		Cleanup();
 		return false;
 	}
 
 	if (listen(ListenSock, SOMAXCONN) == ErrSOCKET_ERROR) {
 		fprintf(Log, "listen() on %s:%d failed: %d\n", bindAddress, port, LastError());
+		Cleanup();
 		return false;
 	}
 
@@ -222,7 +224,7 @@ bool Server::ListenAndRun(const char* bindAddress, int port, std::function<void(
 	if (!Buf)
 		return false;
 
-	fprintf(Log, "Listening on socket %d\n", (int) ListenSock);
+	fprintf(Log, "Listening on port %d. ListenSocket = %d\n", (int) port, (int) ListenSock);
 
 	// Socket is ready to accept connections
 	Run();
@@ -233,6 +235,10 @@ bool Server::ListenAndRun(const char* bindAddress, int port, std::function<void(
 
 void Server::Stop() {
 	StopSignal = true;
+	if (ListenSock != InvalidSocket) {
+		closesocket(ListenSock);
+		ListenSock = InvalidSocket;
+	}
 }
 
 void Server::Run() {
@@ -245,17 +251,11 @@ void Server::Run() {
 			FD_SET(r->Sock, &fds);
 			maxSocket = std::max(maxSocket, r->Sock);
 		}
-		timeval to;
-		to.tv_sec  = 0;
-		to.tv_usec = 1000 * 1000; // 1000 milliseconds
-		int n      = select((int) (maxSocket + 1), &fds, nullptr, nullptr, &to);
+		int n = select((int) (maxSocket + 1), &fds, nullptr, nullptr, nullptr);
+		if (StopSignal)
+			break;
 		if (n <= 0)
 			continue;
-
-		// This is necesary on unix, because select() will abort on Ctrl+C, and then accept will block
-		// [Check the above statement. It was written before changing the condition from (n == 0) to (n <= 0)]
-		//if (StopSignal.load() != 0)
-		//	break;
 
 		if (FD_ISSET(ListenSock, &fds) && Requests.size() < MaxRequests)
 			Accept();
@@ -371,10 +371,8 @@ bool Server::DispatchToHandler(BusyReq* r) {
 	}
 
 	char linebuf[4096];
-	if (w.Body.size() != 0) {
-		sprintf(linebuf, "%llu", (unsigned long long) w.Body.size());
-		w.SetHeader("Content-Length", linebuf);
-	}
+	sprintf(linebuf, "%llu", (unsigned long long) w.Body.size());
+	w.SetHeader("Content-Length", linebuf);
 	SendHeadBuf.resize(0);
 
 	// top line
@@ -513,8 +511,8 @@ void Server::Cleanup() {
 		int err = closesocket(ListenSock);
 		if (err == ErrSOCKET_ERROR)
 			fprintf(Log, "[%d] closesocket(ListenSock) failed: %d\n", (int) ListenSock, LastError());
+		ListenSock = InvalidSocket;
 	}
-	ListenSock = InvalidSocket;
 
 	for (size_t i = 0; i < Requests.size(); i++) {
 		delete Requests[i]->Req;
@@ -572,7 +570,7 @@ void Server::cb_header_done(void* data, const char* at, size_t length) {
 }
 
 int Server::LastError() {
-#ifdef HTTPBRIDGE_PLATFORM_WINDOWS
+#ifdef _WIN32
 	return (int) WSAGetLastError();
 #else
     return errno;

@@ -149,7 +149,9 @@ public:
 	std::atomic<bool> StopSignal;
 
 	bool ListenAndRun(const char* bindAddress, int port, std::function<void(Response& w, Request& r)> handler);
-	void Stop(); // Intended to be called from signal handlers. Just sets StopSignal.
+	// Intended to be called from signal handlers, or another thread.
+	// This sets StopSignal to true, and closes the listening socket
+	void Stop();
 
 private:
 	socket_t                                     ListenSock = InvalidSocket;
