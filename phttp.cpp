@@ -3,12 +3,15 @@
 #include <algorithm>
 #include <assert.h>
 #include <time.h>
+#include <string.h>
 #include "phttp.h"
 #include "http11/http11_parser.h"
 #include "sha1.h"
 
 #ifndef _WIN32
 #include <arpa/inet.h>
+#include <poll.h>
+#include <unistd.h>
 #endif
 
 #ifdef _WIN32
@@ -192,8 +195,10 @@ std::string Request::Header(const char* h) const {
 }
 
 bool Request::IsWebSocketUpgrade() const {
+	// Chrome  (59) sends Connection: Upgrade
+	// Firefox (53) sends Connection: keep-alive, Upgrade
 	return Header("Upgrade") == "websocket" &&
-	       Header("Connection") == "Upgrade";
+	       Header("Connection").find("Upgrade") != -1;
 }
 
 void Response::SetHeader(const std::string& header, const std::string& val) {
@@ -224,6 +229,10 @@ PHTTP_API void Shutdown() {
 #endif
 }
 
+Server::Server() {
+	memset(ClosePipe, 0, sizeof(ClosePipe));
+}
+
 bool Server::ListenAndRun(const char* bindAddress, int port, std::function<void(Response& w, Request& r)> handler) {
 	StopSignal = false;
 	Handler    = handler;
@@ -235,6 +244,17 @@ bool Server::ListenAndRun(const char* bindAddress, int port, std::function<void(
 		fprintf(Log, "socket() failed: %d\n", LastError());
 		return false;
 	}
+
+#ifndef _WIN32
+	// This avoids "socket already in use" errors when frequently restarting server 
+	int optval = 1;
+	setsockopt(ListenSock, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval));
+
+	if (pipe(ClosePipe) == -1) {
+		fprintf(Log, "pipe() failed: %d\n", LastError());
+		return false;
+	}
+#endif
 
 	sockaddr_in service = {0};
 	service.sin_family  = AF_INET;
@@ -273,8 +293,16 @@ bool Server::ListenAndRun(const char* bindAddress, int port, std::function<void(
 void Server::Stop() {
 	StopSignal = true;
 	if (ListenSock != InvalidSocket) {
+#ifdef _WIN32
 		closesocket(ListenSock);
 		ListenSock = InvalidSocket;
+#else
+		// Write a dummy byte into ClosePipe, to wake poll() up, so we can exit cleanly.
+		// The linux docs say that it's illegal to close() a socket from another thread,
+		// while you're busy waiting on it with a select() or poll(), so we use a pipe
+		// here instead.
+		write(ClosePipe[1], "x", 1);
+#endif
 	}
 }
 
@@ -288,6 +316,9 @@ bool Server::SendWebSocket(int64_t websocketID, RequestType type, const void* bu
 }
 
 void Server::Run() {
+	// select() on linux can only monitor FDs that are below FD_SETSIZE, which is 1024 in glibc.
+	// Because of this, we must use poll() on linux.
+#ifdef _WIN32
 	while (!StopSignal) {
 		BigLock.lock();
 		fd_set   fds;
@@ -320,6 +351,45 @@ void Server::Run() {
 		}
 		BigLock.unlock();
 	}
+#else // not _WIN32
+	while (!StopSignal) {
+		BigLock.lock();
+		pollfd fds[MaxRequests + 2];
+		int nfds = 0;
+		fds[nfds++] = {ListenSock, POLLIN, 0}; // code down below assumes ListenSock is fds[0]
+		fds[nfds++] = {ClosePipe[0], POLLIN, 0};
+		for (auto r : Requests) {
+			fds[nfds++] = {r->Sock, POLLIN, 0};
+		}
+
+		BigLock.unlock();
+
+		int n = poll(fds, nfds, -1);
+		if (StopSignal)
+			break;
+		if (n <= 0)
+			continue;
+
+		BigLock.lock();
+		if (!!(fds[0].revents & POLLIN) && Requests.size() < MaxRequests)
+			Accept();
+		for (size_t i = 0; i < Requests.size(); i++) {
+			BusyReq* r = Requests[i];
+			for (int j = 0; j < nfds; j++) {
+				if (fds[j].fd == r->Sock) {
+					if (fds[j].revents) {
+						if (!ReadFromRequest(r)) {
+							CloseRequest(r);
+							i--;
+						}
+					}
+					break;
+				}
+			}
+		}
+		BigLock.unlock();
+	}
+#endif
 }
 
 void Server::Accept() {
@@ -579,7 +649,7 @@ bool Server::ReadFromHttpRequest(BusyReq* r) {
 			http_parser_init(parser);
 			r->ID = NextReqID++;
 			if (LogAllEvents)
-				fprintf(Log, "[%5lld %5d] recycling socket (ID %lld) for another request\n", (long long) r->ID, (int) r->Sock, oldID);
+				fprintf(Log, "[%5lld %5d] recycling socket (ID %lld) for another request\n", (long long) r->ID, (int) r->Sock, (long long) oldID);
 		}
 	}
 
@@ -864,6 +934,7 @@ void Server::CloseRequest(BusyReq* r) {
 void Server::Cleanup() {
 	std::lock_guard<std::mutex> lock(BigLock);
 	if (ListenSock != InvalidSocket) {
+		shutdown(ListenSock, SHUT_RDWR); // not sure if this helps anybody
 		int err = closesocket(ListenSock);
 		if (err == ErrSOCKET_ERROR)
 			fprintf(Log, "[%d] closesocket(ListenSock) failed: %d\n", (int) ListenSock, LastError());
@@ -876,6 +947,12 @@ void Server::Cleanup() {
 		delete Requests[i];
 	}
 	Requests.clear();
+
+	if (ClosePipe[0])
+		close(ClosePipe[0]);
+	if (ClosePipe[1])
+		close(ClosePipe[1]);
+	memset(ClosePipe, 0, sizeof(ClosePipe));
 
 	free(Buf);
 	Buf      = nullptr;

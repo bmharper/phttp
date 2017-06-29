@@ -154,11 +154,15 @@ public:
 	static const socket_t InvalidSocket = (socket_t)(~0);
 #endif
 
-	static const int MaxRequests = 63; // need one socket to listen on
+	// On Windows, FD_SETSIZE is 64. However, we need one socket to listen on, so that's 63.
+	// On linux we use poll(), so we could raise this number on linux.
+	static const int MaxRequests = 63; 
 
 	FILE*             Log          = nullptr;
 	bool              LogAllEvents = false; // If enabled, all socket events are logged
 	std::atomic<bool> StopSignal;
+
+	Server();
 
 	bool ListenAndRun(const char* bindAddress, int port, std::function<void(Response& w, Request& r)> handler);
 
@@ -199,6 +203,7 @@ private:
 	};
 	std::mutex                                   BigLock; // Guards everything in here, except for StopSignal
 	socket_t                                     ListenSock = InvalidSocket;
+	int                                          ClosePipe[2]; // Used on linux to wake poll()
 	std::function<void(Response& w, Request& r)> Handler;
 	std::vector<BusyReq*>                        Requests;
 	int64_t                                      NextReqID       = 1;

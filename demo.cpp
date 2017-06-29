@@ -1,5 +1,7 @@
 #define _CRT_SECURE_NO_WARNINGS 1
 #include "phttp.h"
+#include <thread>
+#include <string.h>
 
 #ifdef _WIN32
 #pragma comment(lib, "Ws2_32.lib")
@@ -10,56 +12,64 @@
 static phttp::Server* SingleServer;
 
 static const char* Script = R"(
-// fetch heavy payload
-//var r = new XMLHttpRequest();
-//r.open('GET', '/heavy');
-//r.send();
 
-// open websocket
-var ws = new WebSocket("ws://localhost:8080");
-var tick = 0;
+var doHeavyFetch = false;
+var doWebSocket = true;
 
-var sendWS = function() {
-	// stop if socket !open
-	if (ws.readyState != 1)
-		return;
+if (doHeavyFetch) {
+	// fetch heavy payload
+	var r = new XMLHttpRequest();
+	r.open('GET', '/heavy');
+	r.send();
+}
 
-	var msg = "Hello!";
-	if (tick % 100 == 0) {
-		for (var i = 0; i < 5000; i++) {
-			msg += "very long message " + i + ", ";
+if (doWebSocket) {
+	// open websocket
+	var ws = new WebSocket("ws://localhost:8080");
+	var tick = 0;
+
+	var sendWS = function() {
+		// stop if socket !open
+		if (ws.readyState != 1)
+			return;
+
+		var msg = "Hello!";
+		if (tick % 100 == 0) {
+			for (var i = 0; i < 5000; i++) {
+				msg += "very long message " + i + ", ";
+			}
+		} else if (tick % 20 == 0) {
+			for (var i = 0; i < 100; i++) {
+				msg += "long message " + i + ", ";
+			}
+		} else {
+			msg = "Hello!" + tick;
+			for (var i = 0; i < tick % 11; i++)
+				msg += ".";
 		}
-	} else if (tick % 20 == 0) {
-		for (var i = 0; i < 100; i++) {
-			msg += "long message " + i + ", ";
-		}
-	} else {
-		msg = "Hello!" + tick;
-		for (var i = 0; i < tick % 11; i++)
-			msg += ".";
-	}
 
-	//var msg = "";
-	//for (var i = 0; i < tick % 11; i++)
-	//	msg += ".";
+		//var msg = "";
+		//for (var i = 0; i < tick % 11; i++)
+		//	msg += ".";
 
-	console.log("sending..." + tick + ", " + ws.readyState);
-	ws.send(msg);
-	console.log("sent" + tick);
-	
-	tick++;
-	setTimeout(function() {
+		console.log("sending..." + tick + ", " + ws.readyState);
+		ws.send(msg);
+		console.log("sent" + tick);
+		
+		tick++;
+		setTimeout(function() {
+			sendWS();
+		}, 100);
+	};
+
+	ws.addEventListener('open', function() {
 		sendWS();
-	}, 100);
-};
+	});
 
-ws.addEventListener('open', function() {
-	sendWS();
-});
-
-ws.addEventListener('message', function(ev) {
-	console.log("Server said: ", ev.data);
-});
+	ws.addEventListener('message', function(ev) {
+		console.log("Server said: ", ev.data);
+	});
+}
 )";
 
 #ifdef _WIN32
@@ -109,9 +119,14 @@ int main(int argc, char** argv) {
 
 	int64_t     wsID = 0;
 	std::thread wsSender([&wsID, &server] {
-		while (wsID == 0)
+		// Wait until a web socket connection is made
+		while (wsID == 0) {
 			sleepnano(100 * 1000 * 1000);
+			if (server.StopSignal)
+				break;
+		}
 
+		// Here we send web socket messages from another thread.
 		for (size_t i = 0; i < 100; i++) {
 			char buf[100];
 			sprintf(buf, "tick tock %d", (int) i);
@@ -136,7 +151,8 @@ int main(int argc, char** argv) {
 
 		if (r.Type == phttp::TypeHttp) {
 			if (r.Path == "/") {
-				w.SetHeader("Content-Type", "text/html");
+				w.SetHeader("Content-Type", "text/html; charset=utf-8");
+				w.SetHeader("Content-Encoding", "utf-8");
 				w.Body = "<!DOCTYPE HTML>\n<head><link rel='stylesheet' href='a.css'></head>\n<body>Hello phttp!</body>\n";
 				w.Body += "<script>";
 				w.Body += Script;
@@ -157,6 +173,12 @@ int main(int argc, char** argv) {
 					w.Body += "" + p.first + ":" + p.second + "\n";
 			}
 		} else if (r.Type == phttp::TypeWebSocketText) {
+			// This demonstrates sending a reply to a websocket frame.
+			// WebSockets are not typically used in a request/response manner,
+			// but if you want to send a websocket frame inside a 
+			// a handler like this, then you must use this mechanism.
+			// You cannot call SendWebSocket from a handler function,
+			// because it violates the simple threading model of phttp::Server.
 			printf("websocket in: %s\n", r.Body.c_str());
 			w.Body = "instant response!";
 		}
