@@ -8,7 +8,9 @@
 #include "http11/http11_parser.h"
 #include "sha1.h"
 
-#ifndef _WIN32
+#ifdef _WIN32
+#include <io.h>
+#else
 #include <arpa/inet.h>
 #include <poll.h>
 #include <unistd.h>
@@ -934,7 +936,6 @@ void Server::CloseRequest(BusyReq* r) {
 void Server::Cleanup() {
 	std::lock_guard<std::mutex> lock(BigLock);
 	if (ListenSock != InvalidSocket) {
-		shutdown(ListenSock, SHUT_RDWR); // not sure if this helps anybody
 		int err = closesocket(ListenSock);
 		if (err == ErrSOCKET_ERROR)
 			fprintf(Log, "[%d] closesocket(ListenSock) failed: %d\n", (int) ListenSock, LastError());
