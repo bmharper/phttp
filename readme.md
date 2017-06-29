@@ -4,6 +4,8 @@ phttp is a tiny HTTP/1.1 embeddable C++11 server library that aims to be correct
 
 phttp was originally built to act as a gateway into local OS resources which are not exposed through the regular browser Javascript API.
 
+Although generally low on features, phttp does support WebSockets.
+
 phttp only uses select(), and it supports Linux and Windows. Because of it's use of select(), it is limited to 63 simultaneous connections. phttp does not try particularly hard to be ultra efficient. For example, it uses std::string and other such things. However, it does avoid wasteful memory copies, so for the intended use case, performance should not be a problem.
 
 A simple server:

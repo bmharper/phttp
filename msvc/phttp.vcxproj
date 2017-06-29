@@ -153,11 +153,13 @@
     <ClCompile Include="..\demo.cpp" />
     <ClCompile Include="..\http11\http11_parser.c" />
     <ClCompile Include="..\phttp.cpp" />
+    <ClCompile Include="..\sha1.c" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="..\http11\http11_common.h" />
     <ClInclude Include="..\http11\http11_parser.h" />
     <ClInclude Include="..\phttp.h" />
+    <ClInclude Include="..\sha1.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

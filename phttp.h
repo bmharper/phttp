@@ -16,6 +16,7 @@
 #include <unordered_map>
 #include <string>
 #include <functional>
+#include <mutex>
 #include <stdio.h> // for FILE*
 
 #ifdef _WIN32
@@ -95,12 +96,30 @@ enum StatusCode {
 	Status511_Network_Authentication_Required = 511,
 };
 
+enum RequestType {
+	TypeHttp,            // HTTP message
+	TypeWebSocketBinary, // Binary WebSocket frame
+	TypeWebSocketText,   // Text WebSocket frame
+};
+
+enum class WebSocketFrameType {
+	Continuation = 0,
+	Text         = 1,
+	Binary       = 2,
+	Close        = 8,
+	Ping         = 9,
+	Pong         = 10,
+	Unknown      = 16,
+};
+
 PHTTP_API bool Initialize();
 PHTTP_API void Shutdown();
 
 class PHTTP_API Request {
 public:
+	RequestType                                      Type          = TypeHttp;
 	size_t                                           ContentLength = 0; // Parsed from the Content-Length header
+	int64_t                                          WebSocketID   = 0; // Only valid if this is a websocket, or if IsWebSocketUpgrade() is true
 	std::string                                      Version;
 	std::vector<std::pair<std::string, std::string>> Headers;
 	std::string                                      Method;
@@ -110,9 +129,10 @@ public:
 	std::string                                      Fragment;
 	std::string                                      RawQuery;
 	std::vector<std::pair<std::string, std::string>> Query; // Parse key+value pairs from QueryString
-	std::string                                      Body;
+	std::string                                      Body;  // Body of HTTP or WebSocket request
 
 	std::string Header(const char* h) const;
+	bool        IsWebSocketUpgrade() const;
 };
 
 class PHTTP_API Response {
@@ -121,7 +141,7 @@ public:
 	std::vector<std::pair<std::string, std::string>> Headers;
 	std::string                                      Body;
 
-	void SetHeader(const char* header, const char* val);
+	void SetHeader(const std::string& header, const std::string& val);
 };
 
 class PHTTP_API Server {
@@ -136,41 +156,80 @@ public:
 
 	static const int MaxRequests = 63; // need one socket to listen on
 
-	struct BusyReq {
-		socket_t Sock         = InvalidSocket;
-		int64_t  ID           = 0;
-		void*    Parser       = nullptr;
-		bool     IsHeaderDone = false;
-		Request* Req          = nullptr;
-	};
-
 	FILE*             Log          = nullptr;
 	bool              LogAllEvents = false; // If enabled, all socket events are logged
 	std::atomic<bool> StopSignal;
 
 	bool ListenAndRun(const char* bindAddress, int port, std::function<void(Response& w, Request& r)> handler);
+
 	// Intended to be called from signal handlers, or another thread.
 	// This sets StopSignal to true, and closes the listening socket
 	void Stop();
 
+	// Send a websocket frame. Can be called from multiple threads.
+	// type must be Binary or Text
+	// Returns false if the WebSocket channel is closed
+	bool SendWebSocket(int64_t websocketID, RequestType type, const void* buf, size_t len);
+
 private:
+	// This represents a socket, which is initially opened for an HTTP request,
+	// but may be recycled for future HTTP requests, or upgraded to a websocket.
+	struct BusyReq {
+		socket_t    Sock         = InvalidSocket;
+		int64_t     ID           = 0; // ID of the channel
+		void*       Parser       = nullptr;
+		bool        IsHeaderDone = false;
+		Request*    Req          = nullptr;
+		std::string HttpHeadBuf; // Buffer of HTTP header
+
+		// WebSocket state
+		bool               IsWebSocket        = false;
+		bool               HaveWebSockHead    = false;
+		bool               IsWebSocketFin     = false; // FIN bit (ie final packet in a sequence. First frame can be final frame)
+		uint64_t           WebSockPayloadRecv = 0;     // Number of payload bytes received in this websocket frame
+		uint64_t           WebSockPayloadLen  = 0;     // Size of this frame's payload
+		uint8_t            WebSockMask[4];
+		uint32_t           WebSockMaskPos = 0;
+		uint8_t            WebSockHeadBuf[14];    // In case we receive less than a full header, we need to save those few bytes for next time
+		size_t             WebSockHeadBufLen = 0; // Number of bytes inside WebSockHeadBuf.
+		WebSocketFrameType WebSockType       = WebSocketFrameType::Unknown;
+		std::string        WebSockControlBody; // Buffer to store body of control frame (specifically Ping or Close). Regular frame's body is stored in Req->Body.
+
+		bool IsWebSockControlFrame() const { return !!((uint8_t) WebSockType & 8); }
+	};
+	std::mutex                                   BigLock; // Guards everything in here, except for StopSignal
 	socket_t                                     ListenSock = InvalidSocket;
 	std::function<void(Response& w, Request& r)> Handler;
 	std::vector<BusyReq*>                        Requests;
-	int64_t                                      NextReqID = 1;
-	size_t                                       BufSize   = 0;
-	char*                                        Buf       = nullptr;
+	int64_t                                      NextReqID       = 1;
+	int64_t                                      NextWebSocketID = 1;
+	size_t                                       BufCap          = 0;       // Capacity of Buf
+	uint8_t*                                     BufStart        = nullptr; // First byte in buffer
+	uint8_t*                                     BufEnd          = nullptr; // One past last byte in buffer. Amount of data in Buf is BufEnd - BufStart.
+	uint8_t*                                     Buf             = nullptr; // Buffer that is used for incoming data. Reset after every recv().
 	std::string                                  SendHeadBuf;
 
 	void Run();
 	void Cleanup();
 	void Accept();
 	void CloseRequest(BusyReq* r);
-	bool ReadFromRequest(BusyReq* r); // Returns false if we must close the socket
+	// Generally, if a function returns false, then we must close the socket
+	bool ReadFromRequest(BusyReq* r);
+	bool ReadFromWebSocket(BusyReq* r);
+	bool ReadFromWebSocketLoop(BusyReq* r);
+	bool ReadFromHttpRequest(BusyReq* r);
+	bool ReadWebSocketHead(BusyReq* r);
 	bool DispatchToHandler(BusyReq* r);
+	void DispatchWebSocketFrame(BusyReq* r);
+	bool SendWebSocketInternal(int64_t websocketID, RequestType type, const void* buf, size_t len); // Assumes BigLock is already held
+	bool UpgradeToWebSocket(Response& w, BusyReq* r);
+	void ReadWebSocketBody(BusyReq* r);
 	bool SendBuffer(BusyReq* r, const char* buf, size_t len);
+	bool SendWebSocketPong(BusyReq* r);
 	bool ParsePath(Request* r);
 	bool ParseQuery(Request* r);
+
+	size_t BufLen() const { return BufEnd - BufStart; }
 
 	// http_parser callbacks
 	static void cb_http_field(void* data, const char* field, size_t flen, const char* value, size_t vlen);

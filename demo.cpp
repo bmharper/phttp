@@ -1,3 +1,4 @@
+#define _CRT_SECURE_NO_WARNINGS 1
 #include "phttp.h"
 
 #ifdef _WIN32
@@ -7,6 +8,59 @@
 #endif
 
 static phttp::Server* SingleServer;
+
+static const char* Script = R"(
+// fetch heavy payload
+//var r = new XMLHttpRequest();
+//r.open('GET', '/heavy');
+//r.send();
+
+// open websocket
+var ws = new WebSocket("ws://localhost:8080");
+var tick = 0;
+
+var sendWS = function() {
+	// stop if socket !open
+	if (ws.readyState != 1)
+		return;
+
+	var msg = "Hello!";
+	if (tick % 100 == 0) {
+		for (var i = 0; i < 5000; i++) {
+			msg += "very long message " + i + ", ";
+		}
+	} else if (tick % 20 == 0) {
+		for (var i = 0; i < 100; i++) {
+			msg += "long message " + i + ", ";
+		}
+	} else {
+		msg = "Hello!" + tick;
+		for (var i = 0; i < tick % 11; i++)
+			msg += ".";
+	}
+
+	//var msg = "";
+	//for (var i = 0; i < tick % 11; i++)
+	//	msg += ".";
+
+	console.log("sending..." + tick + ", " + ws.readyState);
+	ws.send(msg);
+	console.log("sent" + tick);
+	
+	tick++;
+	setTimeout(function() {
+		sendWS();
+	}, 100);
+};
+
+ws.addEventListener('open', function() {
+	sendWS();
+});
+
+ws.addEventListener('message', function(ev) {
+	console.log("Server said: ", ev.data);
+});
+)";
 
 #ifdef _WIN32
 BOOL ctrl_handler(DWORD ev) {
@@ -18,6 +72,10 @@ BOOL ctrl_handler(DWORD ev) {
 }
 void setup_ctrl_c_handler() {
 	SetConsoleCtrlHandler((PHANDLER_ROUTINE) ctrl_handler, TRUE);
+}
+void sleepnano(int64_t nanoseconds) {
+	YieldProcessor();
+	Sleep((DWORD)(nanoseconds / 1000000));
 }
 #else
 void signal_handler(int sig) {
@@ -31,6 +89,12 @@ void setup_ctrl_c_handler() {
 	sig.sa_flags = 0;
 	sigaction(SIGINT, &sig, nullptr);
 }
+void sleepnano(int64_t nanoseconds) {
+	timespec t;
+	t.tv_nsec = nanoseconds % 1000000000;
+	t.tv_sec  = (nanoseconds - t.tv_nsec) / 1000000000;
+	nanosleep(&t, nullptr);
+}
 #endif
 
 int main(int argc, char** argv) {
@@ -41,35 +105,70 @@ int main(int argc, char** argv) {
 
 	phttp::Initialize();
 
-	auto handler = [](phttp::Response& w, phttp::Request& r) {
-		if (r.Path == "/") {
-			w.SetHeader("Content-Type", "text/html");
-			w.Body = "<!DOCTYPE HTML>\n<head><link rel='stylesheet' href='a.css'></head><body>Hello phttp!</body>";
-			// fetch heavy payload
-			w.Body += "<script>x = new XMLHttpRequest(); x.open('GET', '/heavy'); x.send();</script>";
-		} else if (r.Path == "/a.css") {
-			w.SetHeader("Content-Type", "text/css");
-			w.Body = "body { color: #0a0 }";
-		} else if (r.Path == "/heavy") {
-			// Send 32 MB payload
-			w.SetHeader("Content-Type", "text/plain");
-			w.Body = "12345678901234567890123456789012"; // 32 bytes
-			for (int i = 0; i < 20; i++)
-				w.Body += w.Body;
-		} else {
-			w.Body += "Unknown path: " + r.Path + "\n";
-			w.Body += "Query:\n";
-			for (auto p : r.Query)
-				w.Body += "" + p.first + ":" + p.second + "\n";
+	phttp::Server server;
+
+	int64_t     wsID = 0;
+	std::thread wsSender([&wsID, &server] {
+		while (wsID == 0)
+			sleepnano(100 * 1000 * 1000);
+
+		for (size_t i = 0; i < 100; i++) {
+			char buf[100];
+			sprintf(buf, "tick tock %d", (int) i);
+			if (!server.SendWebSocket(wsID, phttp::RequestType::TypeWebSocketText, buf, strlen(buf)))
+				break;
+			sleepnano(200 * 1000 * 1000);
+		}
+	});
+
+	auto handler = [&wsID](phttp::Response& w, phttp::Request& r) {
+		if (r.IsWebSocketUpgrade()) {
+			// Before deciding to return OK, you must validate the Origin header for CORS sake.
+			// To upgrade the connection, send a 200, and populate the Sec-WebSocket-Protocol header,
+			// making it one of the proposed protocols that the client requested.
+			w.Status = 200;
+			// assume client proposed only one protocol, and if so, reply that we're accepting it
+			if (r.Header("Sec-WebSocket-Protocol") != "")
+				w.SetHeader("Sec-WebSocket-Protocol", r.Header("Sec-WebSocket-Protocol"));
+			wsID = r.WebSocketID;
+			return;
+		}
+
+		if (r.Type == phttp::TypeHttp) {
+			if (r.Path == "/") {
+				w.SetHeader("Content-Type", "text/html");
+				w.Body = "<!DOCTYPE HTML>\n<head><link rel='stylesheet' href='a.css'></head>\n<body>Hello phttp!</body>\n";
+				w.Body += "<script>";
+				w.Body += Script;
+				w.Body += "</script>";
+			} else if (r.Path == "/a.css") {
+				w.SetHeader("Content-Type", "text/css");
+				w.Body = "body { color: #0a0 }";
+			} else if (r.Path == "/heavy") {
+				// Send 32 MB payload
+				w.SetHeader("Content-Type", "text/plain");
+				w.Body = "12345678901234567890123456789012"; // 32 bytes
+				for (int i = 0; i < 20; i++)
+					w.Body += w.Body;
+			} else {
+				w.Body += "Unknown path: " + r.Path + "\n";
+				w.Body += "Query:\n";
+				for (auto p : r.Query)
+					w.Body += "" + p.first + ":" + p.second + "\n";
+			}
+		} else if (r.Type == phttp::TypeWebSocketText) {
+			printf("websocket in: %s\n", r.Body.c_str());
+			w.Body = "instant response!";
 		}
 	};
 
-	phttp::Server server;
 	server.LogAllEvents = true;
 	SingleServer        = &server;
 	server.ListenAndRun("127.0.0.1", 8080, handler);
 
 	phttp::Shutdown();
+
+	wsSender.join();
 
 	SingleServer = nullptr;
 	return 0;

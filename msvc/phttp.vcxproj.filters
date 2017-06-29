@@ -27,6 +27,9 @@
     <ClCompile Include="..\phttp.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="..\sha1.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="..\http11\http11_common.h">
@@ -36,6 +39,9 @@
       <Filter>http11</Filter>
     </ClInclude>
     <ClInclude Include="..\phttp.h">
+      <Filter>Source Files</Filter>
+    </ClInclude>
+    <ClInclude Include="..\sha1.h">
       <Filter>Source Files</Filter>
     </ClInclude>
   </ItemGroup>
