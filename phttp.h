@@ -141,7 +141,8 @@ public:
 	std::vector<std::pair<std::string, std::string>> Headers;
 	std::string                                      Body;
 
-	void SetHeader(const std::string& header, const std::string& val);
+	size_t FindHeader(const std::string& header) const; // Returns the index of the first named header, or -1 if not found. Search is case-insensitive
+	void   SetHeader(const std::string& header, const std::string& val);
 };
 
 class PHTTP_API Server {
@@ -156,7 +157,7 @@ public:
 
 	// On Windows, FD_SETSIZE is 64. However, we need one socket to listen on, so that's 63.
 	// On linux we use poll(), so we could raise this number on linux.
-	static const int MaxRequests = 63; 
+	static const int MaxRequests = 63;
 
 	FILE*             Log          = nullptr;
 	bool              LogAllEvents = false; // If enabled, all socket events are logged

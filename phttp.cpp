@@ -203,14 +203,20 @@ bool Request::IsWebSocketUpgrade() const {
 	       Header("Connection").find("Upgrade") != -1;
 }
 
-void Response::SetHeader(const std::string& header, const std::string& val) {
+size_t Response::FindHeader(const std::string& header) const {
 	for (size_t i = 0; i < Headers.size(); i++) {
-		if (Headers[i].first == header) {
-			Headers[i].second = val;
-			return;
-		}
+		if (EqualsNoCase(Headers[i].first.c_str(), header.c_str()))
+			return i;
 	}
-	Headers.push_back({header, val});
+	return -1;
+}
+
+void Response::SetHeader(const std::string& header, const std::string& val) {
+	size_t i = FindHeader(header);
+	if (i != -1)
+		Headers[i].second = val;
+	else
+		Headers.push_back({header, val});
 }
 
 PHTTP_API bool Initialize() {
@@ -248,7 +254,7 @@ bool Server::ListenAndRun(const char* bindAddress, int port, std::function<void(
 	}
 
 #ifndef _WIN32
-	// This avoids "socket already in use" errors when frequently restarting server 
+	// This avoids "socket already in use" errors when frequently restarting server
 	int optval = 1;
 	setsockopt(ListenSock, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval));
 
@@ -299,11 +305,11 @@ void Server::Stop() {
 		closesocket(ListenSock);
 		ListenSock = InvalidSocket;
 #else
-		// Write a dummy byte into ClosePipe, to wake poll() up, so we can exit cleanly.
-		// The linux docs say that it's illegal to close() a socket from another thread,
-		// while you're busy waiting on it with a select() or poll(), so we use a pipe
-		// here instead.
-		write(ClosePipe[1], "x", 1);
+        // Write a dummy byte into ClosePipe, to wake poll() up, so we can exit cleanly.
+        // The linux docs say that it's illegal to close() a socket from another thread,
+        // while you're busy waiting on it with a select() or poll(), so we use a pipe
+        // here instead.
+        write(ClosePipe[1], "x", 1);
 #endif
 	}
 }
@@ -318,8 +324,8 @@ bool Server::SendWebSocket(int64_t websocketID, RequestType type, const void* bu
 }
 
 void Server::Run() {
-	// select() on linux can only monitor FDs that are below FD_SETSIZE, which is 1024 in glibc.
-	// Because of this, we must use poll() on linux.
+// select() on linux can only monitor FDs that are below FD_SETSIZE, which is 1024 in glibc.
+// Because of this, we must use poll() on linux.
 #ifdef _WIN32
 	while (!StopSignal) {
 		BigLock.lock();
@@ -354,43 +360,43 @@ void Server::Run() {
 		BigLock.unlock();
 	}
 #else // not _WIN32
-	while (!StopSignal) {
-		BigLock.lock();
-		pollfd fds[MaxRequests + 2];
-		int nfds = 0;
-		fds[nfds++] = {ListenSock, POLLIN, 0}; // code down below assumes ListenSock is fds[0]
-		fds[nfds++] = {ClosePipe[0], POLLIN, 0};
-		for (auto r : Requests) {
-			fds[nfds++] = {r->Sock, POLLIN, 0};
-		}
+    while (!StopSignal) {
+        BigLock.lock();
+        pollfd fds[MaxRequests + 2];
+        int    nfds = 0;
+        fds[nfds++] = {ListenSock, POLLIN, 0}; // code down below assumes ListenSock is fds[0]
+        fds[nfds++] = {ClosePipe[0], POLLIN, 0};
+        for (auto r : Requests) {
+            fds[nfds++] = {r->Sock, POLLIN, 0};
+        }
 
-		BigLock.unlock();
+        BigLock.unlock();
 
-		int n = poll(fds, nfds, -1);
-		if (StopSignal)
-			break;
-		if (n <= 0)
-			continue;
+        int n = poll(fds, nfds, -1);
+        if (StopSignal)
+            break;
+        if (n <= 0)
+            continue;
 
-		BigLock.lock();
-		if (!!(fds[0].revents & POLLIN) && Requests.size() < MaxRequests)
-			Accept();
-		for (size_t i = 0; i < Requests.size(); i++) {
-			BusyReq* r = Requests[i];
-			for (int j = 0; j < nfds; j++) {
-				if (fds[j].fd == r->Sock) {
-					if (fds[j].revents) {
-						if (!ReadFromRequest(r)) {
-							CloseRequest(r);
-							i--;
-						}
-					}
-					break;
-				}
-			}
-		}
-		BigLock.unlock();
-	}
+        BigLock.lock();
+        if (!!(fds[0].revents & POLLIN) && Requests.size() < MaxRequests)
+            Accept();
+        for (size_t i = 0; i < Requests.size(); i++) {
+            BusyReq* r = Requests[i];
+            for (int j = 0; j < nfds; j++) {
+                if (fds[j].fd == r->Sock) {
+                    if (fds[j].revents) {
+                        if (!ReadFromRequest(r)) {
+                            CloseRequest(r);
+                            i--;
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+        BigLock.unlock();
+    }
 #endif
 }
 
@@ -689,19 +695,21 @@ bool Server::DispatchToHandler(BusyReq* r) {
 	}
 
 	char linebuf[1024];
-	sprintf(linebuf, "%llu", (unsigned long long) w.Body.size());
-	w.SetHeader("Content-Length", linebuf);
+	if (w.FindHeader("Content-Length") == -1) {
+		sprintf(linebuf, "%llu", (unsigned long long) w.Body.size());
+		w.SetHeader("Content-Length", linebuf);
+	}
+
+	if (w.FindHeader("Date") == -1) {
+		MakeDate(linebuf);
+		w.SetHeader("Date", linebuf);
+	}
+
 	SendHeadBuf.resize(0);
 
 	// top line
 	sprintf(linebuf, "HTTP/1.1 %03u %s\r\n", (unsigned) w.Status, StatusMsg(w.Status));
 	SendHeadBuf.append(linebuf);
-
-	// date
-	MakeDate(linebuf);
-	SendHeadBuf.append("Date: ");
-	SendHeadBuf.append(linebuf);
-	SendHeadBuf.append("\r\n");
 
 	// other headers
 	for (const auto& h : w.Headers) {
