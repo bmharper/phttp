@@ -96,10 +96,11 @@ enum StatusCode {
 	Status511_Network_Authentication_Required = 511,
 };
 
-enum RequestType {
-	TypeHttp,            // HTTP message
-	TypeWebSocketBinary, // Binary WebSocket frame
-	TypeWebSocketText,   // Text WebSocket frame
+enum class RequestType {
+	Http,            // HTTP message
+	WebSocketBinary, // Binary WebSocket frame
+	WebSocketText,   // Text WebSocket frame
+	WebSocketClose,  // WebSocket is closing. You cannot send any response to this.
 };
 
 enum class WebSocketFrameType {
@@ -117,7 +118,7 @@ PHTTP_API void Shutdown();
 
 class PHTTP_API Request {
 public:
-	RequestType                                      Type          = TypeHttp;
+	RequestType                                      Type          = RequestType::Http;
 	size_t                                           ContentLength = 0; // Parsed from the Content-Length header
 	int64_t                                          WebSocketID   = 0; // Only valid if this is a websocket, or if IsWebSocketUpgrade() is true
 	std::string                                      Version;
@@ -133,6 +134,9 @@ public:
 
 	std::string Header(const char* h) const;
 	bool        IsWebSocketUpgrade() const;
+	bool        IsHttp() const { return Type == RequestType::Http; }
+	bool        IsWebSocketFrame() const { return Type == RequestType::WebSocketBinary || Type == RequestType::WebSocketText; }
+	bool        IsWebSocketClose() const { return Type == RequestType::WebSocketClose; }
 };
 
 class PHTTP_API Response {

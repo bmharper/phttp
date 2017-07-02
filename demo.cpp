@@ -117,7 +117,9 @@ int main(int argc, char** argv) {
 
 	phttp::Server server;
 
-	int64_t     wsID = 0;
+	// We treat wsID as atomic here, mutating it from multiple threads. In production, use std::atomic<int64_t> instead.
+	int64_t wsID = 0;
+
 	std::thread wsSender([&wsID, &server] {
 		// Wait until a web socket connection is made
 		while (wsID == 0) {
@@ -127,10 +129,10 @@ int main(int argc, char** argv) {
 		}
 
 		// Here we send web socket messages from another thread.
-		for (size_t i = 0; i < 100; i++) {
+		for (size_t i = 0; i < 100 && wsID != 0; i++) {
 			char buf[100];
 			sprintf(buf, "tick tock %d", (int) i);
-			if (!server.SendWebSocket(wsID, phttp::RequestType::TypeWebSocketText, buf, strlen(buf)))
+			if (!server.SendWebSocket(wsID, phttp::RequestType::WebSocketText, buf, strlen(buf)))
 				break;
 			sleepnano(200 * 1000 * 1000);
 		}
@@ -149,7 +151,7 @@ int main(int argc, char** argv) {
 			return;
 		}
 
-		if (r.Type == phttp::TypeHttp) {
+		if (r.Type == phttp::RequestType::Http) {
 			if (r.Path == "/") {
 				w.SetHeader("Content-Type", "text/html; charset=utf-8");
 				w.SetHeader("Content-Encoding", "utf-8");
@@ -172,10 +174,13 @@ int main(int argc, char** argv) {
 				for (auto p : r.Query)
 					w.Body += "" + p.first + ":" + p.second + "\n";
 			}
-		} else if (r.Type == phttp::TypeWebSocketText) {
+		} else if (r.Type == phttp::RequestType::WebSocketClose) {
+			printf("websocket closed by client\n");
+			wsID = 0;
+		} else if (r.Type == phttp::RequestType::WebSocketText) {
 			// This demonstrates sending a reply to a websocket frame.
 			// WebSockets are not typically used in a request/response manner,
-			// but if you want to send a websocket frame inside a 
+			// but if you want to send a websocket frame inside a
 			// a handler like this, then you must use this mechanism.
 			// You cannot call SendWebSocket from a handler function,
 			// because it violates the simple threading model of phttp::Server.

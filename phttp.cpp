@@ -315,7 +315,7 @@ void Server::Stop() {
 }
 
 bool Server::SendWebSocket(int64_t websocketID, RequestType type, const void* buf, size_t len) {
-	if (type != TypeWebSocketBinary && type != TypeWebSocketText) {
+	if (type != RequestType::WebSocketBinary && type != RequestType::WebSocketText) {
 		assert(false);
 		return false;
 	}
@@ -734,8 +734,8 @@ bool Server::DispatchToHandler(BusyReq* r) {
 void Server::DispatchWebSocketFrame(BusyReq* r) {
 	r->Req->WebSocketID = r->ID;
 	switch (r->WebSockType) {
-	case WebSocketFrameType::Binary: r->Req->Type = TypeWebSocketBinary; break;
-	case WebSocketFrameType::Text: r->Req->Type = TypeWebSocketText; break;
+	case WebSocketFrameType::Binary: r->Req->Type = RequestType::WebSocketBinary; break;
+	case WebSocketFrameType::Text: r->Req->Type = RequestType::WebSocketText; break;
 	default:
 		assert(false);
 	}
@@ -752,8 +752,8 @@ bool Server::SendWebSocketInternal(int64_t websocketID, RequestType type, const 
 		if (r->ID == websocketID) {
 			WebSocketFrameType ft = WebSocketFrameType::Unknown;
 			switch (type) {
-			case TypeWebSocketBinary: ft = WebSocketFrameType::Binary; break;
-			case TypeWebSocketText: ft = WebSocketFrameType::Text; break;
+			case RequestType::WebSocketBinary: ft = WebSocketFrameType::Binary; break;
+			case RequestType::WebSocketText: ft = WebSocketFrameType::Text; break;
 			default:
 				assert(false);
 				return false;
@@ -928,6 +928,8 @@ void Server::CloseRequest(BusyReq* r) {
 	if (LogAllEvents)
 		fprintf(Log, "[%5lld %5d] socket closing\n", (long long) r->ID, (int) r->Sock);
 
+	bool isWebSocket = r->IsWebSocket;
+	auto sockID = r->ID;
 	size_t i = 0;
 	for (; i < Requests.size(); i++) {
 		if (Requests[i] == r)
@@ -939,6 +941,15 @@ void Server::CloseRequest(BusyReq* r) {
 	delete r->Req;
 	delete (http_parser*) r->Parser;
 	delete r;
+	if (isWebSocket) {
+		Request cr;
+		cr.Type = RequestType::WebSocketClose;
+		cr.WebSocketID = sockID;
+		Response w;
+		Handler(w, cr);
+		if (w.Body.size() != 0 || w.Status != 0)
+			fprintf(Log, "[%5lld %5d] attempt to send message in response to WebSocketClose\n", (long long) sockID, (int) 0);
+	}
 }
 
 void Server::Cleanup() {
