@@ -196,6 +196,14 @@ std::string Request::Header(const char* h) const {
 	return "";
 }
 
+std::string Request::QueryVal(const char* key) const {
+	for (const auto& p : Query) {
+		if (p.first == key)
+			return p.second;
+	}
+	return "";
+}
+
 bool Request::IsWebSocketUpgrade() const {
 	// Chrome  (59) sends Connection: Upgrade
 	// Firefox (53) sends Connection: keep-alive, Upgrade
@@ -217,6 +225,11 @@ void Response::SetHeader(const std::string& header, const std::string& val) {
 		Headers[i].second = val;
 	else
 		Headers.push_back({header, val});
+}
+
+void Response::SetStatusAndBody(int status, const std::string& body) {
+	Status = status;
+	Body   = body;
 }
 
 PHTTP_API bool Initialize() {
@@ -928,9 +941,9 @@ void Server::CloseRequest(BusyReq* r) {
 	if (LogAllEvents)
 		fprintf(Log, "[%5lld %5d] socket closing\n", (long long) r->ID, (int) r->Sock);
 
-	bool isWebSocket = r->IsWebSocket;
-	auto sockID = r->ID;
-	size_t i = 0;
+	bool   isWebSocket = r->IsWebSocket;
+	auto   sockID      = r->ID;
+	size_t i           = 0;
 	for (; i < Requests.size(); i++) {
 		if (Requests[i] == r)
 			break;
@@ -943,7 +956,7 @@ void Server::CloseRequest(BusyReq* r) {
 	delete r;
 	if (isWebSocket) {
 		Request cr;
-		cr.Type = RequestType::WebSocketClose;
+		cr.Type        = RequestType::WebSocketClose;
 		cr.WebSocketID = sockID;
 		Response w;
 		Handler(w, cr);

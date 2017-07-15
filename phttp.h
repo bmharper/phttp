@@ -132,7 +132,8 @@ public:
 	std::vector<std::pair<std::string, std::string>> Query; // Parse key+value pairs from QueryString
 	std::string                                      Body;  // Body of HTTP or WebSocket request
 
-	std::string Header(const char* h) const;
+	std::string Header(const char* h) const;     // Returns first header found, or empty string. Header name match is case-insensitive
+	std::string QueryVal(const char* key) const; // Returns first value found, or empty string
 	bool        IsWebSocketUpgrade() const;
 	bool        IsHttp() const { return Type == RequestType::Http; }
 	bool        IsWebSocketFrame() const { return Type == RequestType::WebSocketBinary || Type == RequestType::WebSocketText; }
@@ -147,6 +148,7 @@ public:
 
 	size_t FindHeader(const std::string& header) const; // Returns the index of the first named header, or -1 if not found. Search is case-insensitive
 	void   SetHeader(const std::string& header, const std::string& val);
+	void   SetStatusAndBody(int status, const std::string& body);
 };
 
 class PHTTP_API Server {
