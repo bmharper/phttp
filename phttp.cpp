@@ -250,6 +250,17 @@ PHTTP_API void Shutdown() {
 #endif
 }
 
+Logger::~Logger() {
+}
+
+FileLogger::FileLogger(FILE* target) : Target(target) {
+}
+
+void FileLogger::Log(const char* msg) {
+	fwrite(msg, strlen(msg), 1, Target);
+	fwrite("\n", 1, 1, Target);
+}
+
 Server::Server() {
 	memset(ClosePipe, 0, sizeof(ClosePipe));
 }
@@ -258,11 +269,11 @@ bool Server::ListenAndRun(const char* bindAddress, int port, std::function<void(
 	StopSignal = false;
 	Handler    = handler;
 	if (!Log)
-		Log = stdout;
+		Log = std::make_shared<FileLogger>(stdout);
 
 	ListenSock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
 	if (ListenSock == InvalidSocket) {
-		fprintf(Log, "socket() failed: %d\n", LastError());
+		WriteLog("socket() failed: %d", LastError());
 		return false;
 	}
 
@@ -272,7 +283,7 @@ bool Server::ListenAndRun(const char* bindAddress, int port, std::function<void(
 	setsockopt(ListenSock, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval));
 
 	if (pipe(ClosePipe) == -1) {
-		fprintf(Log, "pipe() failed: %d\n", LastError());
+		WriteLog("pipe() failed: %d", LastError());
 		return false;
 	}
 #endif
@@ -284,13 +295,13 @@ bool Server::ListenAndRun(const char* bindAddress, int port, std::function<void(
 
 	int err = ::bind(ListenSock, (sockaddr*) &service, sizeof(service));
 	if (err == ErrSOCKET_ERROR) {
-		fprintf(Log, "bind() on %s:%d failed: %d\n", bindAddress, port, LastError());
+		WriteLog("bind() on %s:%d failed: %d", bindAddress, port, LastError());
 		Cleanup();
 		return false;
 	}
 
 	if (listen(ListenSock, SOMAXCONN) == ErrSOCKET_ERROR) {
-		fprintf(Log, "listen() on %s:%d failed: %d\n", bindAddress, port, LastError());
+		WriteLog("listen() on %s:%d failed: %d", bindAddress, port, LastError());
 		Cleanup();
 		return false;
 	}
@@ -302,7 +313,7 @@ bool Server::ListenAndRun(const char* bindAddress, int port, std::function<void(
 	BufStart = Buf;
 	BufEnd   = Buf;
 
-	fprintf(Log, "Listening on port %d. ListenSocket = %d\n", (int) port, (int) ListenSock);
+	WriteLog("Listening on port %d. ListenSocket = %d", (int) port, (int) ListenSock);
 
 	// Socket is ready to accept connections
 	Run();
@@ -418,7 +429,7 @@ void Server::Accept() {
 	socklen_t   addr_len = sizeof(addr);
 	socket_t    newSock  = accept(ListenSock, (sockaddr*) &addr, &addr_len);
 	if (newSock == InvalidSocket) {
-		fprintf(Log, "accept() failed: %d\n", LastError());
+		WriteLog("accept() failed: %d", LastError());
 		return;
 	}
 	BusyReq* req      = new BusyReq();
@@ -440,17 +451,17 @@ void Server::Accept() {
 	req->Parser            = parser;
 	Requests.push_back(req);
 	if (LogAllEvents)
-		fprintf(Log, "[%5lld %5d] socked opened\n", (long long) req->ID, (int) req->Sock);
+		WriteLog("[%5lld %5d] socked opened", (long long) req->ID, (int) req->Sock);
 }
 
 bool Server::ReadFromRequest(BusyReq* r) {
 	int nread = recv(r->Sock, (char*) Buf, (int) BufCap, 0);
 	if (nread < 0) {
-		fprintf(Log, "[%5lld %5d] recv error %d %d. closing socket\n", (long long) r->ID, (int) r->Sock, nread, LastError());
+		WriteLog("[%5lld %5d] recv error %d %d. closing socket", (long long) r->ID, (int) r->Sock, nread, LastError());
 		return false;
 	} else if (nread == 0) {
 		if (LogAllEvents)
-			fprintf(Log, "[%5lld %5d] socket closed on recv\n", (long long) r->ID, (int) r->Sock);
+			WriteLog("[%5lld %5d] socket closed on recv", (long long) r->ID, (int) r->Sock);
 		return false;
 	}
 
@@ -565,7 +576,7 @@ bool Server::ReadWebSocketHead(BusyReq* r) {
 
 	byte len1 = buf[1];
 	if (!(len1 & 128)) {
-		fprintf(Log, "[%5lld %5d] websocket client didn't mask request\n", (long long) r->ID, (int) r->Sock);
+		WriteLog("[%5lld %5d] websocket client didn't mask request", (long long) r->ID, (int) r->Sock);
 		return false;
 	}
 	r->WebSockPayloadLen = 0;
@@ -636,7 +647,7 @@ bool Server::ReadFromHttpRequest(BusyReq* r) {
 		http_parser_execute(parser, r->HttpHeadBuf.c_str(), r->HttpHeadBuf.size(), parser->nread);
 		BufStart += parser->nread - oldPos;
 		if (!!http_parser_has_error(parser)) {
-			fprintf(Log, "[%5lld %5d] http parser error\n", (long long) r->ID, (int) r->Sock);
+			WriteLog("[%5lld %5d] http parser error", (long long) r->ID, (int) r->Sock);
 			r->HttpHeadBuf.resize(0);
 			return false;
 		} else if (r->IsHeaderDone) {
@@ -661,7 +672,7 @@ bool Server::ReadFromHttpRequest(BusyReq* r) {
 		r->Req = new Request();
 		if (r->IsWebSocket) {
 			if (LogAllEvents)
-				fprintf(Log, "[%5lld %5d] upgraded to websocket\n", (long long) r->ID, (int) r->Sock);
+				WriteLog("[%5lld %5d] upgraded to websocket", (long long) r->ID, (int) r->Sock);
 		} else {
 			// Reset the parser for another request
 			auto oldID      = r->ID;
@@ -670,7 +681,7 @@ bool Server::ReadFromHttpRequest(BusyReq* r) {
 			http_parser_init(parser);
 			r->ID = NextReqID++;
 			if (LogAllEvents)
-				fprintf(Log, "[%5lld %5d] recycling socket (ID %lld) for another request\n", (long long) r->ID, (int) r->Sock, (long long) oldID);
+				WriteLog("[%5lld %5d] recycling socket (ID %lld) for another request", (long long) r->ID, (int) r->Sock, (long long) oldID);
 		}
 	}
 
@@ -679,10 +690,10 @@ bool Server::ReadFromHttpRequest(BusyReq* r) {
 
 bool Server::DispatchToHandler(BusyReq* r) {
 	if (!ParsePath(r->Req))
-		fprintf(Log, "[%5lld %5d] path parse failed: '%s'\n", (long long) r->ID, (int) r->Sock, r->Req->RawPath.c_str());
+		WriteLog("[%5lld %5d] path parse failed: '%s'", (long long) r->ID, (int) r->Sock, r->Req->RawPath.c_str());
 
 	if (!ParseQuery(r->Req))
-		fprintf(Log, "[%5lld %5d] query parse failed: '%s'\n", (long long) r->ID, (int) r->Sock, r->Req->RawQuery.c_str());
+		WriteLog("[%5lld %5d] query parse failed: '%s'", (long long) r->ID, (int) r->Sock, r->Req->RawQuery.c_str());
 
 	if (r->Req->IsWebSocketUpgrade())
 		r->Req->WebSocketID = r->ID;
@@ -845,10 +856,10 @@ bool Server::SendBuffer(BusyReq* r, const char* buf, size_t len) {
 		size_t trySend = std::min(len - sent, (size_t) 1048576);
 		int    nsend   = send(r->Sock, buf + sent, (int) trySend, 0);
 		if (nsend < 0) {
-			fprintf(Log, "[%5lld %5d] send error %d %d\n", (long long) r->ID, (int) r->Sock, nsend, LastError());
+			WriteLog("[%5lld %5d] send error %d %d", (long long) r->ID, (int) r->Sock, nsend, LastError());
 			return false;
 		} else if (nsend == 0) {
-			fprintf(Log, "[%5lld %5d] socket closed on send\n", (long long) r->ID, (int) r->Sock);
+			WriteLog("[%5lld %5d] socket closed on send", (long long) r->ID, (int) r->Sock);
 			return false;
 		}
 		sent += nsend;
@@ -859,7 +870,7 @@ bool Server::SendBuffer(BusyReq* r, const char* buf, size_t len) {
 bool Server::SendWebSocketPong(BusyReq* r) {
 	size_t pingSize = r->WebSockControlBody.size();
 	if (pingSize > 125) {
-		fprintf(Log, "[%5lld %5d] websocket pong larger than 125 bytes (%lld)\n", (long long) r->ID, (int) r->Sock, (long long) pingSize);
+		WriteLog("[%5lld %5d] websocket pong larger than 125 bytes (%lld)", (long long) r->ID, (int) r->Sock, (long long) pingSize);
 		return false;
 	}
 
@@ -937,9 +948,27 @@ bool Server::ParseQuery(Request* r) {
 	return true;
 }
 
+void Server::WriteLog(const char* fmt, ...) {
+	if (!Log)
+		return;
+	const size_t BSIZE = 1024;
+	char         buf[BSIZE];
+	va_list      va;
+	va_start(va, fmt);
+	int n = vsnprintf(buf, BSIZE, fmt, va);
+	va_end(va);
+	if (n < 0 || n >= BSIZE) {
+		Log->Log("Log message truncated. Just emiting format string.");
+		Log->Log(fmt);
+		return;
+	}
+	buf[BSIZE - 1] = 0;
+	Log->Log(buf);
+}
+
 void Server::CloseRequest(BusyReq* r) {
 	if (LogAllEvents)
-		fprintf(Log, "[%5lld %5d] socket closing\n", (long long) r->ID, (int) r->Sock);
+		WriteLog("[%5lld %5d] socket closing", (long long) r->ID, (int) r->Sock);
 
 	bool   isWebSocket = r->IsWebSocket;
 	auto   sockID      = r->ID;
@@ -961,7 +990,7 @@ void Server::CloseRequest(BusyReq* r) {
 		Response w;
 		Handler(w, cr);
 		if (w.Body.size() != 0 || w.Status != 0)
-			fprintf(Log, "[%5lld %5d] attempt to send message in response to WebSocketClose\n", (long long) sockID, (int) 0);
+			WriteLog("[%5lld %5d] attempt to send message in response to WebSocketClose", (long long) sockID, (int) 0);
 	}
 }
 
@@ -970,7 +999,7 @@ void Server::Cleanup() {
 	if (ListenSock != InvalidSocket) {
 		int err = closesocket(ListenSock);
 		if (err == ErrSOCKET_ERROR)
-			fprintf(Log, "[%d] closesocket(ListenSock) failed: %d\n", (int) ListenSock, LastError());
+			WriteLog("[%d] closesocket(ListenSock) failed: %d", (int) ListenSock, LastError());
 		ListenSock = InvalidSocket;
 	}
 

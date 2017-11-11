@@ -17,6 +17,7 @@
 #include <string>
 #include <functional>
 #include <mutex>
+#include <memory>
 #include <stdio.h> // for FILE*
 
 #ifdef _WIN32
@@ -151,6 +152,24 @@ public:
 	void   SetStatusAndBody(int status, const std::string& body);
 };
 
+// Logger interface
+class PHTTP_API Logger {
+public:
+	virtual ~Logger();
+	virtual void Log(const char* msg) = 0;
+};
+
+// Logger that logs to FILE*
+class PHTTP_API FileLogger : public Logger {
+public:
+	FILE* Target = nullptr;
+
+	FileLogger(FILE* target);
+	void Log(const char* msg) override;
+};
+
+typedef std::shared_ptr<Logger> LoggerPtr;
+
 class PHTTP_API Server {
 public:
 #ifdef _WIN32
@@ -165,7 +184,7 @@ public:
 	// On linux we use poll(), so we could raise this number on linux.
 	static const int MaxRequests = 63;
 
-	FILE*             Log          = nullptr;
+	LoggerPtr         Log          = nullptr;
 	bool              LogAllEvents = false; // If enabled, all socket events are logged
 	std::atomic<bool> StopSignal;
 
@@ -240,6 +259,7 @@ private:
 	bool SendWebSocketPong(BusyReq* r);
 	bool ParsePath(Request* r);
 	bool ParseQuery(Request* r);
+	void WriteLog(const char* fmt, ...);
 
 	size_t BufLen() const { return BufEnd - BufStart; }
 
