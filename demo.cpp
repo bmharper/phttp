@@ -138,7 +138,7 @@ int main(int argc, char** argv) {
 		}
 	});
 
-	auto handler = [&wsID](phttp::Response& w, phttp::Request& r) {
+	auto handler = [&server, &wsID](phttp::Response& w, phttp::Request& r) {
 		if (r.IsWebSocketUpgrade()) {
 			// Before deciding to return OK, you must validate the Origin header for CORS sake.
 			// To upgrade the connection, send a 200, and populate the Sec-WebSocket-Protocol header,
@@ -168,6 +168,9 @@ int main(int argc, char** argv) {
 				w.Body = "12345678901234567890123456789012"; // 32 bytes
 				for (int i = 0; i < 20; i++)
 					w.Body += w.Body;
+			} else if (r.Path == "/seppuku") {
+				w.Body += "Stopping server. The client may never receive this message\n";
+				server.Stop();
 			} else {
 				w.Body += "Unknown path: " + r.Path + "\n";
 				w.Body += "Query:\n";

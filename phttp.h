@@ -21,7 +21,9 @@
 #include <stdio.h> // for FILE*
 
 #ifdef _WIN32
+#include <Winsock2.h>
 #include <Ws2tcpip.h>
+#include <mstcpip.h>
 #else
 #include <sys/socket.h>
 #include <sys/types.h>
@@ -180,10 +182,7 @@ public:
 	static const socket_t InvalidSocket = (socket_t)(~0);
 #endif
 
-	// On Windows, FD_SETSIZE is 64. However, we need one socket to listen on, so that's 63.
-	// On linux we use poll(), so we could raise this number on linux.
-	static const int MaxRequests = 63;
-
+	int               MaxRequests  = 1024; // You can raise this to any arbitrary number, no phttp makes no performance guarantees about a large number of concurrent connections.
 	LoggerPtr         Log          = nullptr;
 	bool              LogAllEvents = false; // If enabled, all socket events are logged
 	std::atomic<bool> StopSignal;
@@ -232,6 +231,7 @@ private:
 	int                                          ClosePipe[2]; // Used on linux to wake poll()
 	std::function<void(Response& w, Request& r)> Handler;
 	std::vector<BusyReq*>                        Requests;
+	std::unordered_map<socket_t, BusyReq*>       Sock2Request; // Map from socket to request
 	int64_t                                      NextReqID       = 1;
 	int64_t                                      NextWebSocketID = 1;
 	size_t                                       BufCap          = 0;       // Capacity of Buf

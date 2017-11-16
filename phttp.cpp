@@ -28,6 +28,11 @@ namespace phttp {
 #ifdef _WIN32
 static const uint32_t Infinite        = INFINITE;
 static const int      ErrSOCKET_ERROR = SOCKET_ERROR;
+typedef LONG          nfds_t;
+
+int poll(_Inout_ LPWSAPOLLFD fdArray, _In_ ULONG fds, _In_ INT timeout) {
+	return WSAPoll(fdArray, fds, timeout);
+}
 #else
 static const uint32_t Infinite        = 0xFFFFFFFF;
 static const int      ErrSOCKET_ERROR = -1;
@@ -278,7 +283,7 @@ bool Server::ListenAndRun(const char* bindAddress, int port, std::function<void(
 	}
 
 #ifndef _WIN32
-	// This avoids "socket already in use" errors when frequently restarting server
+	// This avoids "socket already in use" errors when frequently restarting server on linux
 	int optval = 1;
 	setsockopt(ListenSock, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval));
 
@@ -348,80 +353,49 @@ bool Server::SendWebSocket(int64_t websocketID, RequestType type, const void* bu
 }
 
 void Server::Run() {
-// select() on linux can only monitor FDs that are below FD_SETSIZE, which is 1024 in glibc.
-// Because of this, we must use poll() on linux.
-#ifdef _WIN32
+	// (Not that this applies anymore, but it useful to know: select() on linux can only monitor FDs that are below FD_SETSIZE, which is 1024 in glibc.)
 	while (!StopSignal) {
 		BigLock.lock();
-		fd_set   fds;
-		socket_t maxSocket = ListenSock;
-		FD_ZERO(&fds);
-		FD_SET(ListenSock, &fds);
+		std::vector<pollfd> fds;
+		fds.reserve(2 + Requests.size());
+
+		// The code down below which does the Accept() assumes ListenSock is fds[0]
+		fds.push_back({ListenSock, POLLIN, 0});
+#ifndef _WIN32
+		// On WIN32, we just close ListenSock, which is fine. Linux says that's illegal to do from a different thread, so we use a special pipe to wake us up on linux.
+		fds.push_back({ClosePipe[0], POLLIN, 0});
+#endif
+		size_t reqStart = fds.size();
 		for (auto r : Requests) {
-			FD_SET(r->Sock, &fds);
-			maxSocket = std::max(maxSocket, r->Sock);
+			fds.push_back({r->Sock, POLLIN, 0});
 		}
+
 		BigLock.unlock();
 
-		int n = select((int) (maxSocket + 1), &fds, nullptr, nullptr, nullptr);
+		int n = poll(&fds[0], (nfds_t) fds.size(), -1);
 		if (StopSignal)
 			break;
 		if (n <= 0)
 			continue;
 
 		BigLock.lock();
-		if (FD_ISSET(ListenSock, &fds) && Requests.size() < MaxRequests)
+		if (!!(fds[0].revents & POLLIN) && (int) Requests.size() < MaxRequests)
 			Accept();
-		for (size_t i = 0; i < Requests.size(); i++) {
-			BusyReq* r = Requests[i];
-			if (FD_ISSET(r->Sock, &fds)) {
-				if (!ReadFromRequest(r)) {
-					CloseRequest(r);
-					i--;
+
+		for (size_t i = reqStart; i < fds.size(); i++) {
+			if (fds[i].revents) {
+				auto rp = Sock2Request.find(fds[i].fd);
+				if (rp == Sock2Request.end()) {
+					WriteLog("Received data on unknown socket [%5d]", (int) fds[i].fd);
+					continue;
 				}
+				BusyReq* r = rp->second;
+				if (!ReadFromRequest(r))
+					CloseRequest(r);
 			}
 		}
 		BigLock.unlock();
 	}
-#else // not _WIN32
-    while (!StopSignal) {
-        BigLock.lock();
-        pollfd fds[MaxRequests + 2];
-        int    nfds = 0;
-        fds[nfds++] = {ListenSock, POLLIN, 0}; // code down below assumes ListenSock is fds[0]
-        fds[nfds++] = {ClosePipe[0], POLLIN, 0};
-        for (auto r : Requests) {
-            fds[nfds++] = {r->Sock, POLLIN, 0};
-        }
-
-        BigLock.unlock();
-
-        int n = poll(fds, nfds, -1);
-        if (StopSignal)
-            break;
-        if (n <= 0)
-            continue;
-
-        BigLock.lock();
-        if (!!(fds[0].revents & POLLIN) && Requests.size() < MaxRequests)
-            Accept();
-        for (size_t i = 0; i < Requests.size(); i++) {
-            BusyReq* r = Requests[i];
-            for (int j = 0; j < nfds; j++) {
-                if (fds[j].fd == r->Sock) {
-                    if (fds[j].revents) {
-                        if (!ReadFromRequest(r)) {
-                            CloseRequest(r);
-                            i--;
-                        }
-                    }
-                    break;
-                }
-            }
-        }
-        BigLock.unlock();
-    }
-#endif
 }
 
 void Server::Accept() {
@@ -450,6 +424,7 @@ void Server::Accept() {
 	parser->header_done    = cb_header_done;
 	req->Parser            = parser;
 	Requests.push_back(req);
+	Sock2Request.insert({newSock, req});
 	if (LogAllEvents)
 		WriteLog("[%5lld %5d] socked opened", (long long) req->ID, (int) req->Sock);
 }
@@ -732,7 +707,7 @@ bool Server::DispatchToHandler(BusyReq* r) {
 	SendHeadBuf.resize(0);
 
 	// top line
-	sprintf(linebuf, "HTTP/1.1 %03u %s\r\n", (unsigned) w.Status, StatusMsg(w.Status));
+	sprintf(linebuf, "%s %03u %s\r\n", r->Req->Version.c_str(), (unsigned) w.Status, StatusMsg(w.Status));
 	SendHeadBuf.append(linebuf);
 
 	// other headers
@@ -978,6 +953,7 @@ void Server::CloseRequest(BusyReq* r) {
 			break;
 	}
 	assert(i != Requests.size());
+	Sock2Request.erase(r->Sock);
 	closesocket(r->Sock);
 	Requests.erase(Requests.begin() + i);
 	delete r->Req;
@@ -1009,6 +985,7 @@ void Server::Cleanup() {
 		delete Requests[i];
 	}
 	Requests.clear();
+	Sock2Request.clear();
 
 	if (ClosePipe[0])
 		close(ClosePipe[0]);
