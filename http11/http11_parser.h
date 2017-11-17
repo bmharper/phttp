@@ -32,15 +32,15 @@ typedef struct http_parser {
 #ifdef __cplusplus
 extern "C" {
 #endif
-int http_parser_init(http_parser *parser);
-int http_parser_finish(http_parser *parser);
-size_t http_parser_execute(http_parser *parser, const char *data, size_t len, size_t off);
-int http_parser_has_error(http_parser *parser);
-int http_parser_is_finished(http_parser *parser);
+int phttp_parser_init(http_parser *parser);
+int phttp_parser_finish(http_parser *parser);
+size_t phttp_parser_execute(http_parser *parser, const char *data, size_t len, size_t off);
+int phttp_parser_has_error(http_parser *parser);
+int phttp_parser_is_finished(http_parser *parser);
 #ifdef __cplusplus
 }
 #endif
 
-#define http_parser_nread(parser) (parser)->nread 
+#define phttp_parser_nread(parser) (parser)->nread 
 
 #endif

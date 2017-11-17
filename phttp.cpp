@@ -412,7 +412,7 @@ void Server::Accept() {
 	req->IsHeaderDone = false;
 	req->Req          = new Request();
 	auto parser       = new http_parser();
-	http_parser_init(parser);
+	phttp_parser_init(parser);
 	parser->data           = req;
 	parser->http_field     = cb_http_field;
 	parser->request_method = cb_request_method;
@@ -619,9 +619,9 @@ bool Server::ReadFromHttpRequest(BusyReq* r) {
 	if (!r->IsHeaderDone) {
 		r->HttpHeadBuf.append((const char*) BufStart, BufLen());
 		size_t oldPos = parser->nread;
-		http_parser_execute(parser, r->HttpHeadBuf.c_str(), r->HttpHeadBuf.size(), parser->nread);
+		phttp_parser_execute(parser, r->HttpHeadBuf.c_str(), r->HttpHeadBuf.size(), parser->nread);
 		BufStart += parser->nread - oldPos;
-		if (!!http_parser_has_error(parser)) {
+		if (!!phttp_parser_has_error(parser)) {
 			WriteLog("[%5lld %5d] http parser error", (long long) r->ID, (int) r->Sock);
 			r->HttpHeadBuf.resize(0);
 			return false;
@@ -653,7 +653,7 @@ bool Server::ReadFromHttpRequest(BusyReq* r) {
 			auto oldID      = r->ID;
 			r->IsHeaderDone = false;
 			auto parser     = (http_parser*) r->Parser;
-			http_parser_init(parser);
+			phttp_parser_init(parser);
 			r->ID = NextReqID++;
 			if (LogAllEvents)
 				WriteLog("[%5lld %5d] recycling socket (ID %lld) for another request", (long long) r->ID, (int) r->Sock, (long long) oldID);

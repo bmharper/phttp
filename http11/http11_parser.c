@@ -63,7 +63,7 @@ static const int http_parser_en_main = 1;
 
 #line 258 "http11_parser.rl"
 
-int http_parser_init(http_parser *parser) {
+int phttp_parser_init(http_parser *parser) {
   int cs = 0;
   
 #line 71 "http11_parser.c"
@@ -87,7 +87,7 @@ int http_parser_init(http_parser *parser) {
 
 
 /** exec **/
-size_t http_parser_execute(http_parser *parser, const char *buffer, size_t len, size_t off)  
+size_t phttp_parser_execute(http_parser *parser, const char *buffer, size_t len, size_t off)  
 {
   if(len == 0) return 0;
 
@@ -5902,7 +5902,7 @@ case 347:
 
   assert(p <= pe && "Buffer overflow after parsing.");
 
-  if (!http_parser_has_error(parser)) {
+  if (!phttp_parser_has_error(parser)) {
       parser->cs = cs;
   }
 
@@ -5917,21 +5917,21 @@ case 347:
   return(parser->nread);
 }
 
-int http_parser_finish(http_parser *parser)
+int phttp_parser_finish(http_parser *parser)
 {
-  if (http_parser_has_error(parser) ) {
+  if (phttp_parser_has_error(parser) ) {
     return -1;
-  } else if (http_parser_is_finished(parser) ) {
+  } else if (phttp_parser_is_finished(parser) ) {
     return 1;
   } else {
     return 0;
   }
 }
 
-int http_parser_has_error(http_parser *parser) {
+int phttp_parser_has_error(http_parser *parser) {
   return parser->cs == http_parser_error;
 }
 
-int http_parser_is_finished(http_parser *parser) {
+int phttp_parser_is_finished(http_parser *parser) {
   return parser->cs >= http_parser_first_final;
 }
