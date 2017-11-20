@@ -209,6 +209,22 @@ std::string Request::QueryVal(const char* key) const {
 	return "";
 }
 
+int Request::QueryInt(const char* key) const {
+	for (const auto& p : Query) {
+		if (p.first == key)
+			return atoi(p.second.c_str());
+	}
+	return 0;
+}
+
+double Request::QueryDbl(const char* key) const {
+	for (const auto& p : Query) {
+		if (p.first == key)
+			return atof(p.second.c_str());
+	}
+	return 0;
+}
+
 bool Request::IsWebSocketUpgrade() const {
 	// Chrome  (59) sends Connection: Upgrade
 	// Firefox (53) sends Connection: keep-alive, Upgrade
