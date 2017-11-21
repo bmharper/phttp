@@ -11,6 +11,7 @@ phttp only uses poll(), and it supports Linux and Windows (Vista+). phttp does n
 A simple server:
 
 ```cpp
+phttp::Initialize();
 phttp::Server server;
 auto handler = [](phttp::Response& w, phttp::Request& r) {
 	w.Body = "Hello!";
