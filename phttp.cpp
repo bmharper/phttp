@@ -617,7 +617,7 @@ bool Server::ReadWebSocketHead(BusyReq* r) {
 void Server::ReadWebSocketBody(BusyReq* r) {
 	std::string& body = r->IsWebSockControlFrame() ? r->WebSockControlBody : r->Req->Body;
 
-	size_t nread = std::min(BufLen(), r->WebSockPayloadLen - r->WebSockPayloadRecv);
+	size_t nread = std::min<size_t>(BufLen(), r->WebSockPayloadLen - r->WebSockPayloadRecv);
 	byte*  buf   = BufStart;
 	char   mask[4];
 	memcpy(mask, r->WebSockMask, 4);
