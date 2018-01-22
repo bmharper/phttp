@@ -364,8 +364,27 @@ bool Server::SendWebSocket(int64_t websocketID, RequestType type, const void* bu
 		assert(false);
 		return false;
 	}
-	std::lock_guard<std::mutex> lock(BigLock);
-	return SendWebSocketInternal(websocketID, type, buf, len);
+	if (BigLock.try_lock()) {
+		bool res = SendWebSocketInternal(websocketID, type, buf, len);
+		BigLock.unlock();
+		return res;
+	} else {
+		// queue for sending once BigLock exits
+		WebSockOutMsg msg;
+		msg.Buf = malloc(len);
+		if (!msg.Buf) {
+			WriteLog("Failed to allocate %llu bytes for websocket queued message", (unsigned long long) len);
+			return false;
+		}
+		msg.WebSocketID = websocketID;
+		msg.Type        = type;
+		msg.Len         = len;
+
+		WebSocketOutQueueLock.lock();
+		WebSocketOutQueue.push_back(msg);
+		WebSocketOutQueueLock.unlock();
+		return true;
+	}
 }
 
 void Server::Run() {
@@ -410,6 +429,7 @@ void Server::Run() {
 					CloseRequest(r);
 			}
 		}
+		DrainWebSocketOutQueue();
 		BigLock.unlock();
 	}
 }
@@ -759,6 +779,21 @@ void Server::DispatchWebSocketFrame(BusyReq* r) {
 	if (w.Body.size() != 0) {
 		// Send back same type of frame that we received
 		SendWebSocketInternal(r->ID, r->Req->Type, w.Body.c_str(), w.Body.size());
+	}
+}
+
+void Server::DrainWebSocketOutQueue() {
+	while (true) {
+		WebSockOutMsg msg;
+		{
+			std::lock_guard<std::mutex> lock(WebSocketOutQueueLock);
+			if (WebSocketOutQueue.size() == 0)
+				return;
+			msg = WebSocketOutQueue.front();
+			WebSocketOutQueue.erase(WebSocketOutQueue.begin());
+		}
+		SendWebSocketInternal(msg.WebSocketID, msg.Type, msg.Buf, msg.Len);
+		free(msg.Buf);
 	}
 }
 

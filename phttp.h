@@ -228,6 +228,15 @@ private:
 
 		bool IsWebSockControlFrame() const { return !!((uint8_t) WebSockType & 8); }
 	};
+
+	// A websocket message that has been queued for sending
+	struct WebSockOutMsg {
+		int64_t     WebSocketID = 0;
+		RequestType Type        = RequestType::WebSocketBinary;
+		void*       Buf         = nullptr;
+		size_t      Len         = 0;
+	};
+
 	std::mutex                                   BigLock; // Guards everything in here, except for StopSignal
 	socket_t                                     ListenSock = InvalidSocket;
 	int                                          ClosePipe[2]; // Used on linux to wake poll()
@@ -242,6 +251,19 @@ private:
 	uint8_t*                                     Buf             = nullptr; // Buffer that is used for incoming data. Reset after every recv().
 	std::string                                  SendHeadBuf;
 
+	// Queue of websocket messages waiting to be sent.
+	// Why do we need this? We need this because of our extremely simple BigLock, which is held while processing
+	// incoming messages. It is a frequent use case to send a websocket message while processing an HTTP request,
+	// or a websocket frame. However, during that processing, BigLock is held, so we would end up in a deadlock if
+	// we tried to send the message immediately. Instead, we queue up that message, to be sent after processing
+	// any incoming messages. It's unfortunate that we're adding this delay in sending, but right now it feels
+	// like the simplest acceptable solution.
+	// Note that there is one bug in this solution. When we go to sleep on poll(), in our main Run loop, we could
+	// have items inside this queue. This wouldn't be sent until we got woken up. The correct solution is to
+	// make our locking finer grained.
+	std::mutex                 WebSocketOutQueueLock;
+	std::vector<WebSockOutMsg> WebSocketOutQueue;
+
 	void Run();
 	void Cleanup();
 	void Accept();
@@ -254,6 +276,7 @@ private:
 	bool ReadWebSocketHead(BusyReq* r);
 	bool DispatchToHandler(BusyReq* r);
 	void DispatchWebSocketFrame(BusyReq* r);
+	void DrainWebSocketOutQueue();
 	bool SendWebSocketInternal(int64_t websocketID, RequestType type, const void* buf, size_t len); // Assumes BigLock is already held
 	bool UpgradeToWebSocket(Response& w, BusyReq* r);
 	void ReadWebSocketBody(BusyReq* r);
