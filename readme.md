@@ -31,6 +31,20 @@ Just incorporate the source files into your project, however you see fit.
 On Windows, before running a server, you must call `phttp::Initialize()`. This is just a
 wrapper around `WSAStartup()`.
 
+## Threading Model
+All socket _input_ is performed from a single thread, via the Recv() function. This function performs blocking IO,
+using `poll`.
+Socket output can be performed from any thread. When sending, you have the option of using blocking or non-blocking
+writes. Using blocking writes is easier, because you don't need to worry about retries. However, if you want to
+support a large number of concurrent writes, especially for large transfers, like file downloads, then you need
+to use non-blocking writes, so that you can detect when the TCP buffer is full, and back off sending.
+
+## Testing
+
+	cd tests
+	make server
+	go run test.go
+
 ## Attribution
 
 This project uses:

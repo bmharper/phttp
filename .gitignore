@@ -6,3 +6,5 @@ msvc/Debug
 msvc/Release
 msvc/x64
 demo
+tests/server
+tests/test

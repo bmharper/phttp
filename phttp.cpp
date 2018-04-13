@@ -12,6 +12,7 @@
 #include <io.h>
 #else
 #include <arpa/inet.h>
+#include <netinet/tcp.h>
 #include <poll.h>
 #include <unistd.h>
 #endif
@@ -248,6 +249,10 @@ void Response::SetHeader(const std::string& header, const std::string& val) {
 		Headers.push_back({header, val});
 }
 
+void Response::SetStatus(int status) {
+	Status = status;
+}
+
 void Response::SetStatusAndBody(int status, const std::string& body) {
 	Status = status;
 	Body   = body;
@@ -442,6 +447,13 @@ void Server::Accept() {
 		WriteLog("accept() failed: %d", LastError());
 		return;
 	}
+
+	// Always enable NODELAY on our outgoing connections. We leave it up to the user to buffer up his
+	// writes, so that they're sufficiently large. We make sure that we buffer up where we can.
+	// On a spot test on my Ubuntu 16.04 machine, I saw a delay of 40ms with NODELAY switched off (the default setting).
+	int optval = 1;
+	setsockopt(newSock, IPPROTO_TCP, TCP_NODELAY, (void*) &optval, sizeof(optval));
+
 	BusyReq* req      = new BusyReq();
 	req->Sock         = newSock;
 	req->ID           = NextReqID++;

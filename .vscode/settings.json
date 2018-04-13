@@ -1,0 +1,7 @@
+{
+    "python.linting.enabled": false,
+    "python.formatting.provider": "yapf",
+    "files.associations": {
+        "*.ipp": "cpp"
+    }
+}

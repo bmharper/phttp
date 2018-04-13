@@ -119,6 +119,8 @@ enum class WebSocketFrameType {
 PHTTP_API bool Initialize();
 PHTTP_API void Shutdown();
 
+/* A request, which is either an HTTP request, or an incoming WebSocket frame.
+*/
 class PHTTP_API Request {
 public:
 	RequestType                                      Type          = RequestType::Http;
@@ -128,12 +130,12 @@ public:
 	std::vector<std::pair<std::string, std::string>> Headers;
 	std::string                                      Method;
 	std::string                                      URI;
-	std::string                                      RawPath; // Path before performing URL unescaping
-	std::string                                      Path;    // Path with URL unescaping (ie %20 -> 32)
-	std::string                                      Fragment;
-	std::string                                      RawQuery;
-	std::vector<std::pair<std::string, std::string>> Query; // Parse key+value pairs from QueryString
-	std::string                                      Body;  // Body of HTTP or WebSocket request
+	std::string                                      RawPath;  // Path before performing URL unescaping
+	std::string                                      Path;     // Path with URL unescaping (ie %20 -> 32)
+	std::string                                      Fragment; // The portion of the URL after the first #
+	std::string                                      RawQuery; // The portion of the URL after the first ?
+	std::vector<std::pair<std::string, std::string>> Query;    // Parsed key+value pairs from RawQuery
+	std::string                                      Body;     // Body of HTTP request, or WebSocket frame
 
 	std::string Header(const char* h) const;     // Returns first header found, or empty string. Header name match is case-insensitive
 	std::string QueryVal(const char* key) const; // Returns first value found, or empty string
@@ -145,6 +147,8 @@ public:
 	bool        IsWebSocketClose() const { return Type == RequestType::WebSocketClose; }
 };
 
+/* A response to an HTTP request
+*/
 class PHTTP_API Response {
 public:
 	int                                              Status = 0;
@@ -153,6 +157,7 @@ public:
 
 	size_t FindHeader(const std::string& header) const; // Returns the index of the first named header, or -1 if not found. Search is case-insensitive
 	void   SetHeader(const std::string& header, const std::string& val);
+	void   SetStatus(int status);
 	void   SetStatusAndBody(int status, const std::string& body);
 };
 
@@ -172,7 +177,8 @@ public:
 	void Log(const char* msg) override;
 };
 
-typedef std::shared_ptr<Logger> LoggerPtr;
+typedef std::shared_ptr<Logger>  LoggerPtr;
+typedef std::shared_ptr<Request> RequestPtr;
 
 class PHTTP_API Server {
 public:
@@ -184,22 +190,34 @@ public:
 	static const socket_t InvalidSocket = (socket_t)(~0);
 #endif
 
-	int               MaxRequests  = 1024; // You can raise this to any arbitrary number, no phttp makes no performance guarantees about a large number of concurrent connections.
+	int               MaxRequests  = 1024; // You can raise this to 64k, but phttp makes no performance guarantees
 	LoggerPtr         Log          = nullptr;
 	bool              LogAllEvents = false; // If enabled, all socket events are logged
-	std::atomic<bool> StopSignal;
+	std::atomic<bool> StopSignal;           // Toggled by Stop()
 
 	Server();
 
+	// Listen and Recv until we get the stop signal.
+	// This is the simplest way of using phttp, but you can only process a single response as a time.
 	bool ListenAndRun(const char* bindAddress, int port, std::function<void(Response& w, Request& r)> handler);
+
+	// Start listening. Use in combination with Recv() to process incoming messages.
+	bool Listen(const char* bindAddress, int port);
 
 	// Intended to be called from signal handlers, or another thread.
 	// This sets StopSignal to true, and closes the listening socket
 	void Stop();
 
+	// Wait for the next incoming message. This must only be called from a single thread,
+	// which is typically the same thread that called Listen().
+	// Returns nullptr if the stop signal has been received.
+	RequestPtr Recv();
+
+	// Send an HTTP response. This can be called from multiple threads.
+	void SendHttp(Response& w);
+
 	// Send a websocket frame. Can be called from multiple threads.
-	// type must be Binary or Text
-	// Returns false if the WebSocket channel is closed
+	// Returns false if the WebSocket channel has been closed
 	bool SendWebSocket(int64_t websocketID, RequestType type, const void* buf, size_t len);
 
 private:
