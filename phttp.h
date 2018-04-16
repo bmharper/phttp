@@ -150,6 +150,7 @@ public:
 	std::vector<std::pair<std::string, std::string>> Query;    // Parsed key+value pairs from RawQuery
 	std::string                                      Body;     // Body of HTTP request, or WebSocket frame
 
+	Request(int64_t connectionID);
 	std::string Header(const char* h) const;     // Returns first header found, or empty string. Header name match is case-insensitive
 	std::string QueryVal(const char* key) const; // Returns first value found, or empty string
 	int         QueryInt(const char* key) const; // Returns first value found, or zero
@@ -197,6 +198,16 @@ public:
 
 typedef std::shared_ptr<Logger> LoggerPtr;
 
+/* phttp Server
+
+Connection ID
+-------------
+The Connection ID is a 64-bit integer that serves two roles:
+1. Normally, it represents a single HTTP request/response pair.
+2. If we receive a WebSocket upgrade, then the ID remains the same for the duration
+of that websocket's life.
+
+*/
 class PHTTP_API Server {
 public:
 #ifdef _WIN32
@@ -244,18 +255,25 @@ public:
 	void CloseWebSocket(int64_t connectionID, WebSocketCloseReason reason, const void* message = nullptr, size_t messageLen = 0);
 
 private:
+	// The states that a Connection can be in
+	enum class ConnectionState {
+		HttpRecv,
+		HttpSend,
+		WebSocket,
+		Closed,
+	};
 	// This represents a socket, which is initially opened for an HTTP request,
 	// but may be recycled for future HTTP requests, or upgraded to a websocket.
 	struct Connection {
-		socket_t     Sock = InvalidSocket;
-		int64_t      ID   = 0; // ID of the channel
-		phttp_parser Parser;   // HTTP request parser state
-		bool         IsHttpHeaderDone = false;
-		RequestPtr   Request;
-		std::string  HttpHeadBuf; // Buffer of HTTP header
+		ConnectionState State = ConnectionState::HttpRecv;
+		socket_t        Sock  = InvalidSocket;
+		int64_t         ID    = 0;                // ID of the channel (see Server class docs)
+		phttp_parser    Parser;                   // HTTP request parser state
+		bool            IsHttpHeaderDone = false; // Toggled once Parser tells us that it's finished parsing the header
+		RequestPtr      Request;                  // Associated request
+		std::string     HttpHeadBuf;              // Buffer of HTTP header. The parser design needs to have the entire header in memory until it's finished.
 
 		// WebSocket state
-		bool               IsWebSocket        = false;
 		bool               HaveWebSockHead    = false;
 		bool               IsWebSocketFin     = false; // FIN bit (ie final packet in a sequence. First frame can be final frame)
 		uint64_t           WebSockPayloadRecv = 0;     // Number of payload bytes received in this websocket frame
@@ -267,19 +285,20 @@ private:
 		WebSocketFrameType WebSockType       = WebSocketFrameType::Unknown;
 		std::string        WebSockControlBody; // Buffer to store body of control frame (specifically Ping or Close). Regular frame's body is stored in Req->Body.
 
+		Connection();
+		bool IsWebSocket() const { return State == ConnectionState::WebSocket; }
 		bool IsWebSockControlFrame() const { return !!((uint8_t) WebSockType & 8); }
 	};
 
 	typedef std::shared_ptr<Connection> ConnectionPtr;
 
-	socket_t                                     ListenSock = InvalidSocket;
-	int                                          ClosePipe[2]; // Used on linux to wake poll()
-	std::function<void(Response& w, Request& r)> Handler;      // Synchronous event handler for ListenAndRun()
+	socket_t ListenSock = InvalidSocket;
+	int      ClosePipe[2]; // Used on linux to wake poll()
 
 	std::mutex                                  ConnectionsLock; // Guards Connections, Sock2Connection, NextReqID
 	std::vector<ConnectionPtr>                  Connections;
-	std::unordered_map<socket_t, ConnectionPtr> Sock2Connection; // Map from socket to connection
-	std::unordered_map<int64_t, ConnectionPtr>  ID2Connection;   // Map from ID to connection
+	std::unordered_map<socket_t, ConnectionPtr> Sock2Connection; // Map from socket to connection. This changes only when we get a new TCP connection.
+	std::unordered_map<int64_t, ConnectionPtr>  ID2Connection;   // Map from ID to connection. This changes frequently, as connections are recycled for new requests.
 
 	std::atomic<int64_t> NextReqID; // Starts at 1
 
@@ -294,6 +313,7 @@ private:
 	ConnectionPtr ConnectionFromID(int64_t id);
 	void          CloseConnection(ConnectionPtr c);
 	void          CloseConnectionByID(int64_t id);
+	void          ResetForAnotherHttpRequest(ConnectionPtr c);
 	// Generally, if a function returns false, then we must close the socket
 	bool ReadFromConnection(Connection* c, RequestPtr& r);
 	bool ReadFromWebSocket(Connection* c, RequestPtr& r);

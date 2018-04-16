@@ -5,7 +5,6 @@
 #include <time.h>
 #include <string.h>
 #include "phttp.h"
-#include "http11/http11_parser.h"
 #include "sha1.h"
 
 #ifdef _WIN32
@@ -197,6 +196,9 @@ static void Base64Encode(const uint8_t* raw, size_t len, char* enc) {
 	enc[0] = 0;
 }
 
+Request::Request(int64_t connectionID) : ConnectionID(connectionID) {
+}
+
 std::string Request::Header(const char* h) const {
 	for (const auto& p : Headers) {
 		if (EqualsNoCase(p.first.c_str(), h))
@@ -311,6 +313,19 @@ void FileLogger::Log(const char* msg) {
 	fwrite("\n", 1, 1, Target);
 }
 
+Server::Connection::Connection() {
+	phttp_parser_init(&Parser);
+	Parser.data           = this;
+	Parser.http_field     = cb_http_field;
+	Parser.request_method = cb_request_method;
+	Parser.request_uri    = cb_request_uri;
+	Parser.fragment       = cb_fragment;
+	Parser.request_path   = cb_request_path;
+	Parser.query_string   = cb_query_string;
+	Parser.http_version   = cb_http_version;
+	Parser.header_done    = cb_header_done;
+}
+
 Server::Server() {
 	NextReqID = 1;
 	memset(ClosePipe, 0, sizeof(ClosePipe));
@@ -319,13 +334,13 @@ Server::Server() {
 bool Server::ListenAndRun(const char* bindAddress, int port, std::function<void(Response& w, Request& r)> handler) {
 	if (!Listen(bindAddress, port))
 		return false;
-	Handler = handler;
 	while (!StopSignal) {
 		vector<RequestPtr> requests = Recv();
 		for (auto r : requests) {
 			Response w(r);
 			handler(w, *r);
-			SendHttp(w);
+			if (r->Type == RequestType::Http)
+				SendHttp(w);
 		}
 	}
 	Cleanup();
@@ -433,23 +448,9 @@ std::vector<RequestPtr> Server::Recv() {
 				fds.push_back({c->Sock, POLLIN, 0});
 		}
 
-		printf("poll in (%d)\n", (int) Connections.size());
+		//printf("poll in (%d)\n", (int) Connections.size());
 		int n = poll(&fds[0], (nfds_t) fds.size(), -1);
-		printf("poll out\n");
-		/*
-#ifdef _WIN32
-		int n = poll(&fds[0], (nfds_t) fds.size(), -1);
-#else
-        sigset_t set;
-        sigemptyset(&set);
-        //sigaddset(&set, SIGINT);
-        //sigaddset(&set, SIGQUIT);
-        //sigaddset(&set, SIGKILL);
-        printf("poll in\n");
-        int n = ppoll(&fds[0], (nfds_t) fds.size(), nullptr, &set);
-        printf("poll out\n");
-#endif
-*/
+		//printf("poll out\n");
 
 		if (StopSignal)
 			return {};
@@ -512,22 +513,10 @@ void Server::AcceptOrReject() {
 	int optval = 1;
 	setsockopt(newSock, IPPROTO_TCP, TCP_NODELAY, (void*) &optval, sizeof(optval));
 
-	ConnectionPtr con     = make_shared<Connection>();
-	con->Sock             = newSock;
-	con->ID               = NextReqID++;
-	con->IsHttpHeaderDone = false;
-	con->Request          = make_shared<Request>();
-	auto parser           = &con->Parser;
-	phttp_parser_init(parser);
-	parser->data           = con.get();
-	parser->http_field     = cb_http_field;
-	parser->request_method = cb_request_method;
-	parser->request_uri    = cb_request_uri;
-	parser->fragment       = cb_fragment;
-	parser->request_path   = cb_request_path;
-	parser->query_string   = cb_query_string;
-	parser->http_version   = cb_http_version;
-	parser->header_done    = cb_header_done;
+	ConnectionPtr con = make_shared<Connection>();
+	con->Sock         = newSock;
+	con->ID           = NextReqID++;
+	con->Request      = make_shared<Request>(con->ID);
 	{
 		lock_guard<mutex> lock(ConnectionsLock);
 		Connections.push_back(con);
@@ -539,6 +528,14 @@ void Server::AcceptOrReject() {
 }
 
 bool Server::ReadFromConnection(Connection* c, RequestPtr& r) {
+	if (c->State == ConnectionState::HttpSend) {
+		// We are not ready to receive a request. This is illegal (this would be "pipelining", but that never
+		// came into use, and was replaced by HTTP/2).
+		if (LogAllEvents)
+			WriteLog("[%5lld %5d] socket recv while in HttpSend state", (long long) c->ID, (int) c->Sock);
+		return false;
+	}
+
 	int nread = recv(c->Sock, (char*) RecvBuf, (int) RecvBufCap, 0);
 	if (nread < 0) {
 		WriteLog("[%5lld %5d] recv error %d %d. closing socket", (long long) c->ID, (int) c->Sock, nread, LastError());
@@ -549,13 +546,13 @@ bool Server::ReadFromConnection(Connection* c, RequestPtr& r) {
 		return false;
 	}
 
-	WriteLog("[%5lld %5d] read %d", (long long) c->ID, (int) c->Sock, nread);
+	//WriteLog("[%5lld %5d] read %d", (long long) c->ID, (int) c->Sock, nread);
 
 	RecvBufStart = RecvBuf;
 	RecvBufEnd   = RecvBuf + nread;
 
 	bool ok;
-	if (c->IsWebSocket)
+	if (c->IsWebSocket())
 		ok = ReadFromWebSocket(c, r);
 	else
 		ok = ReadFromHttpRequest(c, r);
@@ -606,9 +603,15 @@ bool Server::ReadFromWebSocketLoop(Connection* c, RequestPtr& r) {
 	ReadWebSocketBody(c);
 
 	if (c->IsWebSockControlFrame()) {
-		// lazy - just close TCP socket. Should send a return close frame, unless we initiated it.
-		if (c->WebSockType == WebSocketFrameType::Close)
+		if (c->WebSockType == WebSocketFrameType::Close) {
+			c->Request->Type = RequestType::WebSocketClose;
+			r                = c->Request;
+			// Send a reply Close frame, and then close our socket
+			CloseWebSocket(c->ID, WebSocketCloseReason::Normal);
+			// Returning false will cause us to exit out all the control flow paths. It will cause us to try and
+			// close the socket twice, but not at the kernel level, just inside our own code, which is built to handle that.
 			return false;
+		}
 
 		if (c->WebSockType == WebSocketFrameType::Ping) {
 			if (!SendWebSocketPong(c))
@@ -620,7 +623,6 @@ bool Server::ReadFromWebSocketLoop(Connection* c, RequestPtr& r) {
 		// We could elect to dispatch continuation packets, but let's delay that until it's necessary. Could be an opt-in flag.
 		if (c->IsWebSocketFin) {
 			if (c->WebSockType == WebSocketFrameType::Binary || c->WebSockType == WebSocketFrameType::Text) {
-				c->Request->ConnectionID = c->ID;
 				switch (c->WebSockType) {
 				case WebSocketFrameType::Binary: c->Request->Type = RequestType::WebSocketBinary; break;
 				case WebSocketFrameType::Text: c->Request->Type = RequestType::WebSocketText; break;
@@ -628,8 +630,7 @@ bool Server::ReadFromWebSocketLoop(Connection* c, RequestPtr& r) {
 					assert(false);
 				}
 				r          = c->Request;
-				c->Request = make_shared<Request>();
-				//DispatchWebSocketFrame(c);
+				c->Request = make_shared<Request>(c->ID);
 			}
 			c->Request->Body.resize(0);
 		}
@@ -770,23 +771,8 @@ bool Server::ReadFromHttpRequest(Connection* c, RequestPtr& r) {
 		if (!ParseQuery(c->Request.get()))
 			WriteLog("[%5lld %5d] query parse failed: '%s'", (long long) c->ID, (int) c->Sock, c->Request->RawQuery.c_str());
 
-		c->Request->ConnectionID = c->ID;
-		r                        = c->Request;
-		// reset incoming side of connection so that it can accept another request
-		//ok = DispatchToHandler(c);
-		c->Request = make_shared<Request>();
-		if (c->IsWebSocket) {
-			if (LogAllEvents)
-				WriteLog("[%5lld %5d] upgraded to websocket", (long long) c->ID, (int) c->Sock);
-		} else {
-			// Reset the parser for another request
-			auto oldID          = c->ID;
-			c->IsHttpHeaderDone = false;
-			phttp_parser_init(&c->Parser);
-			c->ID = NextReqID++;
-			if (LogAllEvents)
-				WriteLog("[%5lld %5d] recycling socket (ID %lld) for another request", (long long) c->ID, (int) c->Sock, (long long) oldID);
-		}
+		r        = c->Request;
+		c->State = ConnectionState::HttpSend;
 	}
 
 	return ok;
@@ -798,6 +784,9 @@ void Server::SendHttp(Response& w) {
 }
 
 bool Server::SendHttpInternal(Response& w) {
+	// This wouldn't be a constant if we supported chunked responses, or transmitting a response bit by bit.
+	bool isFinalResponse = true;
+
 	if (w.Status == 0) {
 		if (w.Body.size() == 0) {
 			w.Status = Status500_Internal_Server_Error;
@@ -817,6 +806,11 @@ bool Server::SendHttpInternal(Response& w) {
 			return true;
 		}
 		c = pos->second;
+	}
+
+	if (c->State != ConnectionState::HttpSend) {
+		WriteLog("Attempt to send HTTP response when state is %d", (int) c->State);
+		return false;
 	}
 
 	if (w.Request->IsWebSocketUpgrade() && w.Status == 200) {
@@ -856,10 +850,35 @@ bool Server::SendHttpInternal(Response& w) {
 	// forced to do our own buffering.
 	wbuf.append(w.Body);
 
+	if (isFinalResponse) {
+		// Reset the parser for another request. It is important that we reset to allow new data BEFORE
+		// sending the final bytes of the response. The moment we've sent those bytes, the client is allowed
+		// to contact us on the socket with a new request, and if we didn't prepare the socket to receive
+		// right here, then we'd have a race condition where the client could be requesting on the socket,
+		// and we would not be ready to receive it.
+		ResetForAnotherHttpRequest(c);
+	}
+
 	if (!SendBytes(c.get(), wbuf.c_str(), wbuf.size()))
 		return false;
 
 	return true;
+}
+
+void Server::ResetForAnotherHttpRequest(ConnectionPtr c) {
+	auto oldID          = c->ID;
+	c->State            = ConnectionState::HttpRecv;
+	c->ID               = NextReqID++;
+	c->Request          = make_shared<Request>(c->ID);
+	c->IsHttpHeaderDone = false;
+	phttp_parser_init(&c->Parser);
+	if (LogAllEvents)
+		WriteLog("[%5lld %5d] recycling socket (ID %lld) for another request", (long long) c->ID, (int) c->Sock, (long long) oldID);
+	{
+		lock_guard<mutex> lock(ConnectionsLock);
+		ID2Connection.erase(oldID);
+		ID2Connection.insert({c->ID, c});
+	}
 }
 
 bool Server::SendWebSocket(int64_t connectionID, RequestType type, const void* buf, size_t len) {
@@ -954,7 +973,11 @@ bool Server::UpgradeToWebSocket(Response& w, Connection* c) {
 	if (!SendBytes(c, wbuf.c_str(), wbuf.size()))
 		return false;
 
-	c->IsWebSocket = true;
+	c->State = ConnectionState::WebSocket;
+
+	if (LogAllEvents)
+		WriteLog("[%5lld %5d] upgraded to websocket", (long long) c->ID, (int) c->Sock);
+
 	return true;
 }
 
@@ -1093,8 +1116,7 @@ void Server::CloseConnectionByID(int64_t id) {
 }
 
 void Server::CloseConnection(ConnectionPtr c) {
-	bool isWebSocket = c->IsWebSocket;
-	auto sockID      = c->ID;
+	bool isWebSocket = c->IsWebSocket();
 	{
 		lock_guard<mutex> lock(ConnectionsLock);
 		if (ID2Connection.find(c->ID) == ID2Connection.end()) {
@@ -1111,19 +1133,21 @@ void Server::CloseConnection(ConnectionPtr c) {
 		ID2Connection.erase(c->ID);
 		Connections.erase(Connections.begin() + i);
 		c->Request = nullptr;
+		c->State   = ConnectionState::Closed;
 	}
 	if (LogAllEvents)
 		WriteLog("[%5lld %5d] socket closed", (long long) c->ID, (int) c->Sock);
+	/*
 	if (isWebSocket && Handler) {
 		// Notify synchronous ListenAndRun handler that websocket is closed
-		Request cr;
-		cr.Type         = RequestType::WebSocketClose;
-		cr.ConnectionID = sockID;
+		Request cr(c->ID);
+		cr.Type = RequestType::WebSocketClose;
 		Response w;
 		Handler(w, cr);
 		if (w.Body.size() != 0 || w.Status != 0)
-			WriteLog("[%5lld %5d] attempt to send message in response to WebSocketClose", (long long) sockID, (int) 0);
+			WriteLog("[%5lld %5d] attempt to send message in response to WebSocketClose", (long long) c->ID, (int) 0);
 	}
+	*/
 }
 
 void Server::Cleanup() {

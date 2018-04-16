@@ -47,8 +47,8 @@ void sleepnano(int64_t nanoseconds) {
 
 int main(int argc, char** argv) {
 	phttp::Server s;
-	SingleServer   = &s;
-	s.LogAllEvents = true;
+	SingleServer = &s;
+	//s.LogAllEvents = true;
 	if (argc != 2) {
 		printf("Must specify run mode such as --ListenAndRun");
 		return 1;

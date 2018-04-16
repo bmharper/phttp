@@ -19,7 +19,8 @@ import (
 )
 
 const serverURl = "http://localhost:8080"
-const externalServer = true // Enable this when debugging C++ code
+const externalServer = false // Enable this when debugging C++ code
+const enableProfile = false
 
 type testFunc struct {
 	runMode string
@@ -43,18 +44,20 @@ func main() {
 		return true
 	}
 
-	f, err := os.Create("profile.prof")
-	if err != nil {
-		log.Fatal(err)
+	if enableProfile {
+		f, err := os.Create("profile.prof")
+		if err != nil {
+			log.Fatal(err)
+		}
+		err = pprof.StartCPUProfile(f)
+		if err != nil {
+			log.Fatal(err)
+		}
+		defer func() {
+			pprof.StopCPUProfile()
+			f.Close()
+		}()
 	}
-	err = pprof.StartCPUProfile(f)
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer func() {
-		pprof.StopCPUProfile()
-		f.Close()
-	}()
 
 	tests := []testFunc{
 		{"--ListenAndRun", TestBasic},
@@ -144,8 +147,8 @@ func (c *context) getExpect(url string, statusCode int, responseBody string) {
 
 func TestBasic(cx *context) {
 	for i := 0; i < 5000; i++ {
-		fmt.Printf("Get %v - ", i)
+		//fmt.Printf("Get %v - ", i)
 		cx.getExpect("/", 200, "Hello")
-		fmt.Printf("have %v\n", i)
+		//fmt.Printf("have %v\n", i)
 	}
 }
