@@ -218,10 +218,11 @@ public:
 	static const socket_t InvalidSocket = (socket_t)(~0);
 #endif
 
-	int               MaxConnections = 4096; // You can raise this to 64k, but phttp makes no performance guarantees
-	LoggerPtr         Log            = nullptr;
-	bool              LogAllEvents   = false; // If enabled, all socket events are logged
-	std::atomic<bool> StopSignal;             // Toggled by Stop()
+	int               MaxConnections   = 4096; // You can raise this to 64k, but phttp makes no performance guarantees
+	LoggerPtr         Log              = nullptr;
+	bool              LogAllEvents     = false; // If enabled, all socket events are logged
+	bool              LogInitialListen = true;  // Log initial bind
+	std::atomic<bool> StopSignal;               // Toggled by Stop()
 
 	Server();
 
@@ -260,6 +261,7 @@ private:
 		HttpRecv,
 		HttpSend,
 		WebSocket,
+		Shutdown,
 		Closed,
 	};
 	// This represents a socket, which is initially opened for an HTTP request,

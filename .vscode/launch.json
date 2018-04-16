@@ -10,7 +10,7 @@
             "request": "launch",
             "program": "${workspaceFolder}/tests/server",
             "args": [
-                "--ListenAndRun"
+                "--Concurrent"
             ],
             "stopAtEntry": false,
             "cwd": "${workspaceFolder}",

@@ -50,6 +50,7 @@ to use non-blocking writes, so that you can detect when the TCP buffer is full, 
 This project uses:
 * http11 parser by Zed A. Shaw and Mongrel2 Project Contributors
 * SHA1 by Dr Brian Gladman, Worcester, UK
+* Semaphore by Jeff Preshing
 
 License: MIT
 Author: Ben Harper (github.com/bmharper/phttp)

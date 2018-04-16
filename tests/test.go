@@ -2,8 +2,12 @@ package main
 
 // When iterating on these tests, do:
 //   make -s server && go run test.go
+// To benchmark with ab:
+//   make server && ./server --Concurrent
+//   ab -k -n 10000 -c 4 http://localhost:8080/echo-method
 
 import (
+	"bytes"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -18,7 +22,7 @@ import (
 	"time"
 )
 
-const serverURl = "http://localhost:8080"
+const serverURL = "http://localhost:8080"
 const externalServer = false // Enable this when debugging C++ code
 const enableProfile = false
 
@@ -61,6 +65,8 @@ func main() {
 
 	tests := []testFunc{
 		{"--ListenAndRun", TestBasic},
+		{"--ListenAndRun", TestMethods},
+		{"--Concurrent", TestConcurrency},
 	}
 
 	for _, t := range tests {
@@ -126,22 +132,31 @@ func (c *context) close() {
 	}
 }
 
-func (c *context) getExpect(url string, statusCode int, responseBody string) {
-	resp, err := c.client.Get(serverURl + url)
+func (c *context) getExpect(url string, expectCode int, expectBody string) {
+	c.expect("GET", url, "", expectCode, expectBody)
+}
+
+func (c *context) expect(method, url, body string, expectCode int, expectBody string) {
+	bodyReader := bytes.NewReader([]byte(body))
+	req, err := http.NewRequest(method, serverURL+url, bodyReader)
+	if err != nil {
+		dieMsgf("Failed to create request: %v", err)
+	}
+	resp, err := c.client.Do(req)
 	//dumpHeaders(resp)
 	if err != nil {
-		dieMsgf("Fetching %v, expected %v '%v', but got %v", url, statusCode, responseBody, err)
+		dieMsgf("Fetching %v, expected %v '%v', but got %v", url, expectCode, expectBody, err)
 	}
-	if resp.StatusCode != statusCode {
-		dieMsgf("Fetching %v, expected %v '%v', but got status code %v", url, statusCode, responseBody, resp.StatusCode)
+	if resp.StatusCode != expectCode {
+		dieMsgf("Fetching %v, expected %v '%v', but got status code %v", url, expectCode, expectBody, resp.StatusCode)
 	}
-	body, err := ioutil.ReadAll(resp.Body)
+	actualBody, err := ioutil.ReadAll(resp.Body)
 	resp.Body.Close()
 	if err != nil {
-		dieMsgf("Fetching %v, expected %v '%v', but got %v when reading body", url, statusCode, responseBody, err)
+		dieMsgf("Fetching %v, expected %v '%v', but got %v when reading body", url, expectCode, expectBody, err)
 	}
-	if string(body) != responseBody {
-		dieMsgf("Fetching %v, expected %v '%v', but got body '%v'", url, statusCode, responseBody, string(body))
+	if string(actualBody) != expectBody {
+		dieMsgf("Fetching %v, expected %v '%v', but got body '%v'", url, expectCode, expectBody, string(actualBody))
 	}
 }
 
@@ -151,4 +166,44 @@ func TestBasic(cx *context) {
 		cx.getExpect("/", 200, "Hello")
 		//fmt.Printf("have %v\n", i)
 	}
+}
+
+func TestMethods(cx *context) {
+	cx.expect("DELETE", "/echo-method", "foo", 200, "DELETE-foo")
+	cx.expect("GET", "/echo-method", "", 200, "GET-")
+	cx.expect("HEAD", "/echo-method", "", 200, "")
+	cx.expect("OPTIONS", "/echo-method", "", 200, "OPTIONS-")
+	cx.expect("PATCH", "/echo-method", "foo", 200, "PATCH-foo")
+	cx.expect("POST", "/echo-method", "foo", 200, "POST-foo")
+	cx.expect("PUT", "/echo-method", "foo", 200, "PUT-foo")
+	cx.expect("TRACE", "/echo-method", "", 200, "TRACE-")
+}
+
+func TestConcurrency(cx *context) {
+	// I don't know why, but when I raise the concurrency level above 2, then the Go
+	// HTTP client seems to close and reopen TCP sockets. I don't *think* it's something
+	// that phttp is doing.
+	// I get *much* higher numbers using "ab" to benchmark - 130k/s vs 30k/s (requests/s)
+	nthread := 2
+	done := make(chan bool, nthread)
+	//start := time.Now()
+	num := 5000
+	for i := 0; i < nthread; i++ {
+		myID := i
+		go func() {
+			for j := 0; j < num; j++ {
+				if j%100 == 0 {
+					//fmt.Printf("Thread %v, %v/%v\n", myID, j, num)
+				}
+				body := fmt.Sprintf("%v-%v", myID, j)
+				cx.expect("POST", "/echo-method", body, 200, "POST-MT-"+body)
+			}
+			done <- true
+		}()
+	}
+	for i := 0; i < nthread; i++ {
+		<-done
+	}
+	//duration := time.Now().Sub(start)
+	//fmt.Printf("\n  Requests per second: %v\n", int(float64(num*nthread)/duration.Seconds()))
 }

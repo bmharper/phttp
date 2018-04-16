@@ -309,6 +309,8 @@ FileLogger::FileLogger(FILE* target) : Target(target) {
 }
 
 void FileLogger::Log(const char* msg) {
+	if (!Target)
+		return;
 	fwrite(msg, strlen(msg), 1, Target);
 	fwrite("\n", 1, 1, Target);
 }
@@ -396,7 +398,8 @@ bool Server::Listen(const char* bindAddress, int port) {
 		return false;
 	}
 
-	WriteLog("Listening on port %d. ListenSocket = %d", (int) port, (int) ListenSock);
+	if (LogInitialListen)
+		WriteLog("Listening on port %d. ListenSocket = %d", (int) port, (int) ListenSock);
 
 	if (RecvBuf == nullptr) {
 		RecvBufCap = 16384;
@@ -463,6 +466,10 @@ std::vector<RequestPtr> Server::Recv() {
 			AcceptOrReject();
 
 		for (size_t i = reqStart; i < fds.size(); i++) {
+			if (fds[i].revents == POLLNVAL) {
+				WriteLog("Invalid poll() request on socket [%5d]", (int) fds[i].fd);
+				continue;
+			}
 			if (fds[i].revents) {
 				ConnectionPtr c;
 				{
@@ -470,6 +477,10 @@ std::vector<RequestPtr> Server::Recv() {
 					auto              con = Sock2Connection.find(fds[i].fd);
 					if (con == Sock2Connection.end()) {
 						WriteLog("Received data on unknown socket [%5d]", (int) fds[i].fd);
+						char buf[1000];
+						int  nread = recv(fds[i].fd, buf, sizeof(buf), 0);
+						buf[nread] = 0;
+						printf("buf:\n%s\n", buf);
 						continue;
 					}
 					c = con->second;
@@ -787,6 +798,11 @@ bool Server::SendHttpInternal(Response& w) {
 	// This wouldn't be a constant if we supported chunked responses, or transmitting a response bit by bit.
 	bool isFinalResponse = true;
 
+	if (w.Request->Method == "HEAD" && w.Body.size() != 0) {
+		WriteLog("HEAD response may not contain a body");
+		return false;
+	}
+
 	if (w.Status == 0) {
 		if (w.Body.size() == 0) {
 			w.Status = Status500_Internal_Server_Error;
@@ -830,6 +846,18 @@ bool Server::SendHttpInternal(Response& w) {
 		w.SetHeader("Date", linebuf);
 	}
 
+	// For HTTP/1.0, keep-alive is not the default
+	bool keepAlive = true;
+	if (c->Request->Version == "HTTP/1.0") {
+		auto ch = c->Request->Header("Connection");
+		if (ch.find("Keep-Alive") == -1 && ch.find("keep-alive") == -1)
+			keepAlive = false;
+	}
+
+	if (w.FindHeader("Connection") == -1 && c->Request->Version == "HTTP/1.0" && keepAlive) {
+		w.SetHeader("Connection", "Keep-Alive");
+	}
+
 	string wbuf;
 
 	// top line
@@ -850,7 +878,7 @@ bool Server::SendHttpInternal(Response& w) {
 	// forced to do our own buffering.
 	wbuf.append(w.Body);
 
-	if (isFinalResponse) {
+	if (isFinalResponse && keepAlive) {
 		// Reset the parser for another request. It is important that we reset to allow new data BEFORE
 		// sending the final bytes of the response. The moment we've sent those bytes, the client is allowed
 		// to contact us on the socket with a new request, and if we didn't prepare the socket to receive
@@ -861,6 +889,11 @@ bool Server::SendHttpInternal(Response& w) {
 
 	if (!SendBytes(c.get(), wbuf.c_str(), wbuf.size()))
 		return false;
+
+	if (isFinalResponse && !keepAlive) {
+		c->State = ConnectionState::Shutdown;
+		shutdown(c->Sock, 2); // 2 = SHUT_RDWR(unix) = SD_BOTH(win32)
+	}
 
 	return true;
 }
