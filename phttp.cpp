@@ -15,6 +15,8 @@
 #include <netinet/tcp.h>
 #include <poll.h>
 #include <unistd.h>
+#include <fcntl.h>
+#include <signal.h>
 #endif
 
 #ifdef _WIN32
@@ -23,6 +25,7 @@
 #endif
 
 typedef unsigned char byte;
+using namespace std;
 
 namespace phttp {
 
@@ -97,7 +100,7 @@ static const char* StatusMsg(int code) {
 	case Status426_Upgrade_Required: return "Upgrade Required";
 	case Status427_Unassigned: return "Unassigned";
 	case Status428_Precondition_Required: return "Precondition Required";
-	case Status429_Too_Many_Requests: return "Too Many Requests";
+	case Status429_Too_Many_Requests: return "Too Many Connections";
 	case Status430_Unassigned: return "Unassigned";
 	case Status431_Request_Header_Fields_Too_Large: return "Request Header Fields Too Large";
 	case Status500_Internal_Server_Error: return "Internal Server Error";
@@ -233,6 +236,12 @@ bool Request::IsWebSocketUpgrade() const {
 	       Header("Connection").find("Upgrade") != -1;
 }
 
+Response::Response() {
+}
+
+Response::Response(RequestPtr request) : Request(request) {
+}
+
 size_t Response::FindHeader(const std::string& header) const {
 	for (size_t i = 0; i < Headers.size(); i++) {
 		if (EqualsNoCase(Headers[i].first.c_str(), header.c_str()))
@@ -276,6 +285,21 @@ PHTTP_API void Shutdown() {
 #endif
 }
 
+// Returns true on success, or false if there was an error
+static bool SetNonBlocking(int fd) {
+	bool blocking = false;
+#ifdef _WIN32
+	unsigned long mode = blocking ? 0 : 1;
+	return (ioctlsocket(fd, FIONBIO, &mode) == 0) ? true : false;
+#else
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags == -1)
+        return false;
+    flags = blocking ? (flags & ~O_NONBLOCK) : (flags | O_NONBLOCK);
+    return (fcntl(fd, F_SETFL, flags) == 0) ? true : false;
+#endif
+}
+
 Logger::~Logger() {
 }
 
@@ -288,12 +312,29 @@ void FileLogger::Log(const char* msg) {
 }
 
 Server::Server() {
+	NextReqID = 1;
 	memset(ClosePipe, 0, sizeof(ClosePipe));
 }
 
 bool Server::ListenAndRun(const char* bindAddress, int port, std::function<void(Response& w, Request& r)> handler) {
+	if (!Listen(bindAddress, port))
+		return false;
+	Handler = handler;
+	while (!StopSignal) {
+		vector<RequestPtr> requests = Recv();
+		for (auto r : requests) {
+			Response w(r);
+			handler(w, *r);
+			SendHttp(w);
+		}
+	}
+	Cleanup();
+	return true;
+}
+
+bool Server::Listen(const char* bindAddress, int port) {
+	NextReqID  = 1;
 	StopSignal = false;
-	Handler    = handler;
 	if (!Log)
 		Log = std::make_shared<FileLogger>(stdout);
 
@@ -314,6 +355,14 @@ bool Server::ListenAndRun(const char* bindAddress, int port, std::function<void(
 	}
 #endif
 
+	// This is necessary so that an accept() will never block. Were it not for this call, then
+	// accept() could block, if the status of the listening socket had changed in between the time
+	// when poll() woke us up, and the time that we called accept()
+	if (!SetNonBlocking(ListenSock)) {
+		WriteLog("Failed to set ListenSock to non-blocking mode: %d", LastError());
+		return false;
+	}
+
 	sockaddr_in service = {0};
 	service.sin_family  = AF_INET;
 	inet_pton(AF_INET, bindAddress, &service.sin_addr);
@@ -332,18 +381,18 @@ bool Server::ListenAndRun(const char* bindAddress, int port, std::function<void(
 		return false;
 	}
 
-	BufCap = 4096;
-	Buf    = (uint8_t*) malloc(BufCap);
-	if (!Buf)
-		return false;
-	BufStart = Buf;
-	BufEnd   = Buf;
-
 	WriteLog("Listening on port %d. ListenSocket = %d", (int) port, (int) ListenSock);
 
-	// Socket is ready to accept connections
-	Run();
-	Cleanup();
+	if (RecvBuf == nullptr) {
+		RecvBufCap = 16384;
+		RecvBuf    = (uint8_t*) malloc(RecvBufCap);
+		if (!RecvBuf) {
+			WriteLog("Out of memory allocating %d bytes for RecvBuf", (int) RecvBufCap);
+			return false;
+		}
+	}
+	RecvBufStart = RecvBuf;
+	RecvBufEnd   = RecvBuf;
 
 	return true;
 }
@@ -364,82 +413,87 @@ void Server::Stop() {
 	}
 }
 
-bool Server::SendWebSocket(int64_t websocketID, RequestType type, const void* buf, size_t len) {
-	if (type != RequestType::WebSocketBinary && type != RequestType::WebSocketText) {
-		assert(false);
-		return false;
-	}
-	if (BigLock.try_lock()) {
-		bool res = SendWebSocketInternal(websocketID, type, buf, len);
-		BigLock.unlock();
-		return res;
-	} else {
-		// queue for sending once BigLock exits
-		WebSockOutMsg msg;
-		msg.Buf = malloc(len);
-		if (!msg.Buf) {
-			WriteLog("Failed to allocate %llu bytes for websocket queued message", (unsigned long long) len);
-			return false;
-		}
-		msg.WebSocketID = websocketID;
-		msg.Type        = type;
-		msg.Len         = len;
+std::vector<RequestPtr> Server::Recv() {
+	std::vector<RequestPtr> requests;
+	while (true) {
+		vector<pollfd> fds;
+		size_t         reqStart = 0;
+		{
+			lock_guard<mutex> lock(ConnectionsLock);
+			fds.reserve(2 + Connections.size());
 
-		WebSocketOutQueueLock.lock();
-		WebSocketOutQueue.push_back(msg);
-		WebSocketOutQueueLock.unlock();
-		return true;
-	}
-}
-
-void Server::Run() {
-	// (Not that this applies anymore, but it useful to know: select() on linux can only monitor FDs that are below FD_SETSIZE, which is 1024 in glibc.)
-	while (!StopSignal) {
-		BigLock.lock();
-		std::vector<pollfd> fds;
-		fds.reserve(2 + Requests.size());
-
-		// The code down below which does the Accept() assumes ListenSock is fds[0]
-		fds.push_back({ListenSock, POLLIN, 0});
+			// The code down below which does the Accept() assumes ListenSock is fds[0]
+			fds.push_back({ListenSock, POLLIN, 0});
 #ifndef _WIN32
-		// On WIN32, we just close ListenSock, which is fine. Linux says that's illegal to do from a different thread, so we use a special pipe to wake us up on linux.
-		fds.push_back({ClosePipe[0], POLLIN, 0});
+			// On WIN32, we just close ListenSock, which is fine. Linux says that's illegal to do from a different thread, so we use a special pipe to wake us up on linux.
+			fds.push_back({ClosePipe[0], POLLIN, 0});
 #endif
-		size_t reqStart = fds.size();
-		for (auto r : Requests) {
-			fds.push_back({r->Sock, POLLIN, 0});
+			reqStart = fds.size();
+			for (auto c : Connections)
+				fds.push_back({c->Sock, POLLIN, 0});
 		}
 
-		BigLock.unlock();
-
+		printf("poll in (%d)\n", (int) Connections.size());
 		int n = poll(&fds[0], (nfds_t) fds.size(), -1);
-		if (StopSignal)
-			break;
-		if (n <= 0)
-			continue;
+		printf("poll out\n");
+		/*
+#ifdef _WIN32
+		int n = poll(&fds[0], (nfds_t) fds.size(), -1);
+#else
+        sigset_t set;
+        sigemptyset(&set);
+        //sigaddset(&set, SIGINT);
+        //sigaddset(&set, SIGQUIT);
+        //sigaddset(&set, SIGKILL);
+        printf("poll in\n");
+        int n = ppoll(&fds[0], (nfds_t) fds.size(), nullptr, &set);
+        printf("poll out\n");
+#endif
+*/
 
-		BigLock.lock();
-		if (!!(fds[0].revents & POLLIN) && (int) Requests.size() < MaxRequests)
-			Accept();
+		if (StopSignal)
+			return {};
+		if (n <= 0) {
+			WriteLog("poll failed. errno: %v", errno);
+			return {};
+		}
+
+		if (!!(fds[0].revents & POLLIN))
+			AcceptOrReject();
 
 		for (size_t i = reqStart; i < fds.size(); i++) {
 			if (fds[i].revents) {
-				auto rp = Sock2Request.find(fds[i].fd);
-				if (rp == Sock2Request.end()) {
-					WriteLog("Received data on unknown socket [%5d]", (int) fds[i].fd);
-					continue;
+				ConnectionPtr c;
+				{
+					lock_guard<mutex> lock(ConnectionsLock);
+					auto              con = Sock2Connection.find(fds[i].fd);
+					if (con == Sock2Connection.end()) {
+						WriteLog("Received data on unknown socket [%5d]", (int) fds[i].fd);
+						continue;
+					}
+					c = con->second;
 				}
-				BusyReq* r = rp->second;
-				if (!ReadFromRequest(r))
-					CloseRequest(r);
+				RequestPtr r;
+				if (!ReadFromConnection(c.get(), r))
+					CloseConnection(c);
+				if (r != nullptr)
+					requests.push_back(r);
 			}
 		}
-		DrainWebSocketOutQueue();
-		BigLock.unlock();
+		if (requests.size() != 0)
+			return requests;
 	}
+	// unreachable
+	return {};
 }
 
-void Server::Accept() {
+void Server::AcceptOrReject() {
+	bool haveCapacity = false;
+	{
+		lock_guard<mutex> lock(ConnectionsLock);
+		haveCapacity = (int) Connections.size() < MaxConnections;
+	}
+
 	sockaddr_in addr;
 	socklen_t   addr_len = sizeof(addr);
 	socket_t    newSock  = accept(ListenSock, (sockaddr*) &addr, &addr_len);
@@ -447,21 +501,25 @@ void Server::Accept() {
 		WriteLog("accept() failed: %d", LastError());
 		return;
 	}
+	if (!haveCapacity) {
+		closesocket(newSock);
+		return;
+	}
 
-	// Always enable NODELAY on our outgoing connections. We leave it up to the user to buffer up his
+	// Always enable NODELAY on our connections. We leave it up to the user to buffer up his
 	// writes, so that they're sufficiently large. We make sure that we buffer up where we can.
 	// On a spot test on my Ubuntu 16.04 machine, I saw a delay of 40ms with NODELAY switched off (the default setting).
 	int optval = 1;
 	setsockopt(newSock, IPPROTO_TCP, TCP_NODELAY, (void*) &optval, sizeof(optval));
 
-	BusyReq* req      = new BusyReq();
-	req->Sock         = newSock;
-	req->ID           = NextReqID++;
-	req->IsHeaderDone = false;
-	req->Req          = new Request();
-	auto parser       = new http_parser();
+	ConnectionPtr con     = make_shared<Connection>();
+	con->Sock             = newSock;
+	con->ID               = NextReqID++;
+	con->IsHttpHeaderDone = false;
+	con->Request          = make_shared<Request>();
+	auto parser           = &con->Parser;
 	phttp_parser_init(parser);
-	parser->data           = req;
+	parser->data           = con.get();
 	parser->http_field     = cb_http_field;
 	parser->request_method = cb_request_method;
 	parser->request_uri    = cb_request_uri;
@@ -470,110 +528,125 @@ void Server::Accept() {
 	parser->query_string   = cb_query_string;
 	parser->http_version   = cb_http_version;
 	parser->header_done    = cb_header_done;
-	req->Parser            = parser;
-	Requests.push_back(req);
-	Sock2Request.insert({newSock, req});
+	{
+		lock_guard<mutex> lock(ConnectionsLock);
+		Connections.push_back(con);
+		Sock2Connection.insert({newSock, con});
+		ID2Connection.insert({con->ID, con});
+	}
 	if (LogAllEvents)
-		WriteLog("[%5lld %5d] socked opened", (long long) req->ID, (int) req->Sock);
+		WriteLog("[%5lld %5d] socked opened", (long long) con->ID, (int) con->Sock);
 }
 
-bool Server::ReadFromRequest(BusyReq* r) {
-	int nread = recv(r->Sock, (char*) Buf, (int) BufCap, 0);
+bool Server::ReadFromConnection(Connection* c, RequestPtr& r) {
+	int nread = recv(c->Sock, (char*) RecvBuf, (int) RecvBufCap, 0);
 	if (nread < 0) {
-		WriteLog("[%5lld %5d] recv error %d %d. closing socket", (long long) r->ID, (int) r->Sock, nread, LastError());
+		WriteLog("[%5lld %5d] recv error %d %d. closing socket", (long long) c->ID, (int) c->Sock, nread, LastError());
 		return false;
 	} else if (nread == 0) {
 		if (LogAllEvents)
-			WriteLog("[%5lld %5d] socket closed on recv", (long long) r->ID, (int) r->Sock);
+			WriteLog("[%5lld %5d] socket closed on recv", (long long) c->ID, (int) c->Sock);
 		return false;
 	}
 
-	BufStart = Buf;
-	BufEnd   = Buf + nread;
+	WriteLog("[%5lld %5d] read %d", (long long) c->ID, (int) c->Sock, nread);
+
+	RecvBufStart = RecvBuf;
+	RecvBufEnd   = RecvBuf + nread;
 
 	bool ok;
-	if (r->IsWebSocket)
-		ok = ReadFromWebSocket(r);
+	if (c->IsWebSocket)
+		ok = ReadFromWebSocket(c, r);
 	else
-		ok = ReadFromHttpRequest(r);
+		ok = ReadFromHttpRequest(c, r);
 
 	// Since every recv can be for a different request, we can't share the buffer between requests.
-	BufStart = Buf;
-	BufEnd   = Buf;
+	RecvBufStart = RecvBuf;
+	RecvBufEnd   = RecvBuf;
 
 	return ok;
 }
 
-bool Server::ReadFromWebSocket(BusyReq* r) {
+bool Server::ReadFromWebSocket(Connection* c, RequestPtr& r) {
 	// Loop over websocket data until we can't make any further progress.
 	// If there is any data left in the buffer, then it means that
 	// we have an incomplete header. The maximum size of a header is 14
 	// bytes, so if we haven't made progress, and we have 14 bytes or
 	// more inside our buffer, then we have a bug.
-	byte* prevBufStart = BufStart - 1;
-	while (BufStart != prevBufStart) {
-		prevBufStart = BufStart;
-		if (!ReadFromWebSocketLoop(r))
+	byte* prevBufStart = RecvBufStart - 1;
+	while (RecvBufStart != prevBufStart) {
+		prevBufStart = RecvBufStart;
+		if (!ReadFromWebSocketLoop(c, r))
 			return false;
 	}
 	// See comment above
-	size_t len = BufLen();
+	size_t len = RecvBufLen();
 	assert(len < 14);
 
 	if (len != 0) {
-		// The buffer in 'Buf' is shared by all connections, so we can't expect it to still be ours
+		// The buffer in 'RecvBuf' is shared by all connections, so we can't expect it to still be ours
 		// when our next bytes come in on our TCP socket. So, if we were left with an incomplete header,
 		// then we need to save those bytes for next time. This is a rare occurrence, so we don't mind
 		// if it incurs some memmove penalties.
-		memcpy(r->WebSockHeadBuf + r->WebSockHeadBufLen, BufStart, BufLen());
-		r->WebSockHeadBufLen += BufLen();
+		memcpy(c->WebSockHeadBuf + c->WebSockHeadBufLen, RecvBufStart, RecvBufLen());
+		c->WebSockHeadBufLen += RecvBufLen();
 	}
 
 	return true;
 }
 
-bool Server::ReadFromWebSocketLoop(BusyReq* r) {
-	if (!r->HaveWebSockHead) {
-		if (!ReadWebSocketHead(r))
+bool Server::ReadFromWebSocketLoop(Connection* c, RequestPtr& r) {
+	if (!c->HaveWebSockHead) {
+		if (!ReadWebSocketHead(c))
 			return false;
 	}
-	if (!r->HaveWebSockHead)
+	if (!c->HaveWebSockHead)
 		return true;
 
-	ReadWebSocketBody(r);
+	ReadWebSocketBody(c);
 
-	if (r->IsWebSockControlFrame()) {
+	if (c->IsWebSockControlFrame()) {
 		// lazy - just close TCP socket. Should send a return close frame, unless we initiated it.
-		if (r->WebSockType == WebSocketFrameType::Close)
+		if (c->WebSockType == WebSocketFrameType::Close)
 			return false;
 
-		if (r->WebSockType == WebSocketFrameType::Ping) {
-			if (!SendWebSocketPong(r))
+		if (c->WebSockType == WebSocketFrameType::Ping) {
+			if (!SendWebSocketPong(c))
 				return false;
 		}
 	}
 
-	if (r->WebSockPayloadRecv == r->WebSockPayloadLen) {
+	if (c->WebSockPayloadRecv == c->WebSockPayloadLen) {
 		// We could elect to dispatch continuation packets, but let's delay that until it's necessary. Could be an opt-in flag.
-		if (r->IsWebSocketFin) {
-			if (r->WebSockType == WebSocketFrameType::Binary || r->WebSockType == WebSocketFrameType::Text)
-				DispatchWebSocketFrame(r);
-			r->Req->Body.resize(0);
+		if (c->IsWebSocketFin) {
+			if (c->WebSockType == WebSocketFrameType::Binary || c->WebSockType == WebSocketFrameType::Text) {
+				c->Request->ConnectionID = c->ID;
+				switch (c->WebSockType) {
+				case WebSocketFrameType::Binary: c->Request->Type = RequestType::WebSocketBinary; break;
+				case WebSocketFrameType::Text: c->Request->Type = RequestType::WebSocketText; break;
+				default:
+					assert(false);
+				}
+				r          = c->Request;
+				c->Request = make_shared<Request>();
+				//DispatchWebSocketFrame(c);
+			}
+			c->Request->Body.resize(0);
 		}
 		// Reset to receive another frame
-		r->HaveWebSockHead    = false;
-		r->IsWebSocketFin     = false;
-		r->WebSockPayloadRecv = 0;
-		r->WebSockPayloadLen  = 0;
-		r->WebSockType        = WebSocketFrameType::Unknown;
-		r->WebSockMaskPos     = 0;
-		r->WebSockControlBody.resize(0);
-		memset(r->WebSockMask, 0, 4);
+		c->HaveWebSockHead    = false;
+		c->IsWebSocketFin     = false;
+		c->WebSockPayloadRecv = 0;
+		c->WebSockPayloadLen  = 0;
+		c->WebSockType        = WebSocketFrameType::Unknown;
+		c->WebSockMaskPos     = 0;
+		c->WebSockControlBody.resize(0);
+		memset(c->WebSockMask, 0, 4);
 	}
 	return true;
 }
 
-bool Server::ReadWebSocketHead(BusyReq* r) {
+bool Server::ReadWebSocketHead(Connection* c) {
 	// This function might run more than once. It is extremely unlikely in practice, but it certainly
 	// is possible. For example, if the client sends us one byte at a time, then this function will enter
 	// multiple times, each time getting a little bit further, but giving up several times, before
@@ -585,37 +658,37 @@ bool Server::ReadWebSocketHead(BusyReq* r) {
 	// Not all 14 bytes are necessarily populated.
 
 	byte   buf[14];
-	size_t extraBytes = std::min(BufLen(), 14 - r->WebSockHeadBufLen);
-	memcpy(buf, r->WebSockHeadBuf, r->WebSockHeadBufLen);
-	memcpy(buf + r->WebSockHeadBufLen, BufStart, extraBytes);
-	size_t bufLen = r->WebSockHeadBufLen + extraBytes;
+	size_t extraBytes = std::min(RecvBufLen(), 14 - c->WebSockHeadBufLen);
+	memcpy(buf, c->WebSockHeadBuf, c->WebSockHeadBufLen);
+	memcpy(buf + c->WebSockHeadBufLen, RecvBufStart, extraBytes);
+	size_t bufLen = c->WebSockHeadBufLen + extraBytes;
 
 	// Need 2nd byte for payload len. The shortest header is 2 bytes. The longest header is 14 bytes.
 	if (bufLen < 2)
 		return true;
 
-	r->IsWebSocketFin = !!(buf[0] & 128);
-	r->WebSockType    = (WebSocketFrameType)(buf[0] & 15);
+	c->IsWebSocketFin = !!(buf[0] & 128);
+	c->WebSockType    = (WebSocketFrameType)(buf[0] & 15);
 
 	byte len1 = buf[1];
 	if (!(len1 & 128)) {
-		WriteLog("[%5lld %5d] websocket client didn't mask request", (long long) r->ID, (int) r->Sock);
+		WriteLog("[%5lld %5d] websocket client didn't mask request", (long long) c->ID, (int) c->Sock);
 		return false;
 	}
-	r->WebSockPayloadLen = 0;
+	c->WebSockPayloadLen = 0;
 	len1 &= 127;
 	size_t bytesOfLen = 0;
 	if (len1 < 126) {
 		// 7-bit length. 0..125
-		r->WebSockPayloadLen = len1;
+		c->WebSockPayloadLen = len1;
 		bytesOfLen           = 1;
 	} else if (len1 == 126 && bufLen >= 4) {
 		// 16-bit length 126..65535
-		r->WebSockPayloadLen = ((uint16_t) buf[2] << 8) | (uint16_t) buf[3];
+		c->WebSockPayloadLen = ((uint16_t) buf[2] << 8) | (uint16_t) buf[3];
 		bytesOfLen           = 3;
 	} else if (len1 == 127 && bufLen >= 10) {
 		// 64-bit length 65536..LARGE
-		r->WebSockPayloadLen = ((uint64_t) buf[2] << 56) |
+		c->WebSockPayloadLen = ((uint64_t) buf[2] << 56) |
 		                       ((uint64_t) buf[3] << 48) |
 		                       ((uint64_t) buf[4] << 40) |
 		                       ((uint64_t) buf[5] << 32) |
@@ -624,7 +697,7 @@ bool Server::ReadWebSocketHead(BusyReq* r) {
 		                       ((uint64_t) buf[8] << 8) |
 		                       ((uint64_t) buf[9]);
 		bytesOfLen = 9;
-		assert(r->WebSockPayloadLen < 1000000);
+		assert(c->WebSockPayloadLen < 1000000);
 	}
 
 	if (bytesOfLen == 0)
@@ -638,43 +711,43 @@ bool Server::ReadWebSocketHead(BusyReq* r) {
 	if (!haveMask)
 		return true;
 
-	memcpy(r->WebSockMask, buf + 1 + bytesOfLen, 4);
-	r->HaveWebSockHead = true;
-	BufStart += headerSize - r->WebSockHeadBufLen;
-	r->WebSockHeadBufLen = 0;
+	memcpy(c->WebSockMask, buf + 1 + bytesOfLen, 4);
+	c->HaveWebSockHead = true;
+	RecvBufStart += headerSize - c->WebSockHeadBufLen;
+	c->WebSockHeadBufLen = 0;
 
 	return true;
 }
 
-void Server::ReadWebSocketBody(BusyReq* r) {
-	std::string& body = r->IsWebSockControlFrame() ? r->WebSockControlBody : r->Req->Body;
+void Server::ReadWebSocketBody(Connection* c) {
+	std::string& body = c->IsWebSockControlFrame() ? c->WebSockControlBody : c->Request->Body;
 
-	size_t nread = std::min<size_t>(BufLen(), r->WebSockPayloadLen - r->WebSockPayloadRecv);
-	byte*  buf   = BufStart;
+	size_t nread = std::min<size_t>(RecvBufLen(), c->WebSockPayloadLen - c->WebSockPayloadRecv);
+	byte*  buf   = RecvBufStart;
 	char   mask[4];
-	memcpy(mask, r->WebSockMask, 4);
-	uint32_t mp = r->WebSockMaskPos;
+	memcpy(mask, c->WebSockMask, 4);
+	uint32_t mp = c->WebSockMaskPos;
 	for (size_t i = 0; i < nread; i++, mp = (mp + 1) & 3)
 		body += buf[i] ^ mask[mp];
 
-	r->WebSockMaskPos = mp;
-	r->WebSockPayloadRecv += nread;
-	BufStart += nread;
+	c->WebSockMaskPos = mp;
+	c->WebSockPayloadRecv += nread;
+	RecvBufStart += nread;
 }
 
-bool Server::ReadFromHttpRequest(BusyReq* r) {
-	auto parser = (http_parser*) r->Parser;
-	if (!r->IsHeaderDone) {
-		r->HttpHeadBuf.append((const char*) BufStart, BufLen());
+bool Server::ReadFromHttpRequest(Connection* c, RequestPtr& r) {
+	auto parser = &c->Parser;
+	if (!c->IsHttpHeaderDone) {
+		c->HttpHeadBuf.append((const char*) RecvBufStart, RecvBufLen());
 		size_t oldPos = parser->nread;
-		phttp_parser_execute(parser, r->HttpHeadBuf.c_str(), r->HttpHeadBuf.size(), parser->nread);
-		BufStart += parser->nread - oldPos;
+		phttp_parser_execute(parser, c->HttpHeadBuf.c_str(), c->HttpHeadBuf.size(), parser->nread);
+		RecvBufStart += parser->nread - oldPos;
 		if (!!phttp_parser_has_error(parser)) {
-			WriteLog("[%5lld %5d] http parser error", (long long) r->ID, (int) r->Sock);
-			r->HttpHeadBuf.resize(0);
+			WriteLog("[%5lld %5d] http parser error", (long long) c->ID, (int) c->Sock);
+			c->HttpHeadBuf.resize(0);
 			return false;
-		} else if (r->IsHeaderDone) {
-			r->HttpHeadBuf.resize(0);
+		} else if (c->IsHttpHeaderDone) {
+			c->HttpHeadBuf.resize(0);
 		}
 	}
 
@@ -684,47 +757,47 @@ bool Server::ReadFromHttpRequest(BusyReq* r) {
 	// The server will wait for a response before sending another request.
 	// WebSockets are full duplex, which is why their implementation is more complex.
 
-	// It is normal for IsHeaderDone to be true now, even through it was false in the above block
-	if (r->IsHeaderDone && BufLen() != 0)
-		r->Req->Body.append((const char*) BufStart, BufLen());
+	// It is normal for IsHttpHeaderDone to be true now, even through it was false in the above block
+	if (c->IsHttpHeaderDone && RecvBufLen() != 0)
+		c->Request->Body.append((const char*) RecvBufStart, RecvBufLen());
 
 	bool ok = true;
-	if (r->IsHeaderDone && r->Req->Body.size() == r->Req->ContentLength) {
-		ok = DispatchToHandler(r);
-		delete r->Req;
-		r->Req = new Request();
-		if (r->IsWebSocket) {
+	if (c->IsHttpHeaderDone && c->Request->Body.size() == c->Request->ContentLength) {
+		// HTTP request is ready to be consumed
+		if (!ParsePath(c->Request.get()))
+			WriteLog("[%5lld %5d] path parse failed: '%s'", (long long) c->ID, (int) c->Sock, c->Request->RawPath.c_str());
+
+		if (!ParseQuery(c->Request.get()))
+			WriteLog("[%5lld %5d] query parse failed: '%s'", (long long) c->ID, (int) c->Sock, c->Request->RawQuery.c_str());
+
+		c->Request->ConnectionID = c->ID;
+		r                        = c->Request;
+		// reset incoming side of connection so that it can accept another request
+		//ok = DispatchToHandler(c);
+		c->Request = make_shared<Request>();
+		if (c->IsWebSocket) {
 			if (LogAllEvents)
-				WriteLog("[%5lld %5d] upgraded to websocket", (long long) r->ID, (int) r->Sock);
+				WriteLog("[%5lld %5d] upgraded to websocket", (long long) c->ID, (int) c->Sock);
 		} else {
 			// Reset the parser for another request
-			auto oldID      = r->ID;
-			r->IsHeaderDone = false;
-			auto parser     = (http_parser*) r->Parser;
-			phttp_parser_init(parser);
-			r->ID = NextReqID++;
+			auto oldID          = c->ID;
+			c->IsHttpHeaderDone = false;
+			phttp_parser_init(&c->Parser);
+			c->ID = NextReqID++;
 			if (LogAllEvents)
-				WriteLog("[%5lld %5d] recycling socket (ID %lld) for another request", (long long) r->ID, (int) r->Sock, (long long) oldID);
+				WriteLog("[%5lld %5d] recycling socket (ID %lld) for another request", (long long) c->ID, (int) c->Sock, (long long) oldID);
 		}
 	}
 
 	return ok;
 }
 
-bool Server::DispatchToHandler(BusyReq* r) {
-	if (!ParsePath(r->Req))
-		WriteLog("[%5lld %5d] path parse failed: '%s'", (long long) r->ID, (int) r->Sock, r->Req->RawPath.c_str());
+void Server::SendHttp(Response& w) {
+	if (!SendHttpInternal(w))
+		CloseConnectionByID(w.Request->ConnectionID);
+}
 
-	if (!ParseQuery(r->Req))
-		WriteLog("[%5lld %5d] query parse failed: '%s'", (long long) r->ID, (int) r->Sock, r->Req->RawQuery.c_str());
-
-	if (r->Req->IsWebSocketUpgrade())
-		r->Req->WebSocketID = r->ID;
-
-	// Call the user-provided handler
-	Response w;
-	Handler(w, *r->Req);
-
+bool Server::SendHttpInternal(Response& w) {
 	if (w.Status == 0) {
 		if (w.Body.size() == 0) {
 			w.Status = Status500_Internal_Server_Error;
@@ -735,8 +808,19 @@ bool Server::DispatchToHandler(BusyReq* r) {
 		}
 	}
 
-	if (r->Req->IsWebSocketUpgrade() && w.Status == 200) {
-		if (!UpgradeToWebSocket(w, r))
+	ConnectionPtr c;
+	{
+		lock_guard<mutex> lock(ConnectionsLock);
+		auto              pos = ID2Connection.find(w.Request->ConnectionID);
+		if (pos == ID2Connection.end()) {
+			// connection has been closed
+			return true;
+		}
+		c = pos->second;
+	}
+
+	if (w.Request->IsWebSocketUpgrade() && w.Status == 200) {
+		if (!UpgradeToWebSocket(w, c.get()))
 			return false;
 		return true;
 	}
@@ -752,152 +836,140 @@ bool Server::DispatchToHandler(BusyReq* r) {
 		w.SetHeader("Date", linebuf);
 	}
 
-	SendHeadBuf.resize(0);
+	string wbuf;
 
 	// top line
-	sprintf(linebuf, "%s %03u %s\r\n", r->Req->Version.c_str(), (unsigned) w.Status, StatusMsg(w.Status));
-	SendHeadBuf.append(linebuf);
+	sprintf(linebuf, "%s %03u %s\r\n", w.Request->Version.c_str(), (unsigned) w.Status, StatusMsg(w.Status));
+	wbuf.append(linebuf);
 
 	// other headers
 	for (const auto& h : w.Headers) {
-		SendHeadBuf.append(h.first);
-		SendHeadBuf.append(": ");
-		SendHeadBuf.append(h.second);
-		SendHeadBuf.append("\r\n");
+		wbuf.append(h.first);
+		wbuf.append(": ");
+		wbuf.append(h.second);
+		wbuf.append("\r\n");
 	}
-	SendHeadBuf.append("\r\n");
+	wbuf.append("\r\n");
 
-	// Send head
-	if (!SendBuffer(r, SendHeadBuf.c_str(), SendHeadBuf.size()))
-		return false;
+	// It would be nice if we could avoid this memcpy of the body. Ideally, you'd have a flag on write()
+	// that would tell the kernel "OK, you can send now". We always set TCP_NODELAY, so we're
+	// forced to do our own buffering.
+	wbuf.append(w.Body);
 
-	// Send body
-	if (!SendBuffer(r, w.Body.c_str(), w.Body.size()))
+	if (!SendBytes(c.get(), wbuf.c_str(), wbuf.size()))
 		return false;
 
 	return true;
 }
 
-void Server::DispatchWebSocketFrame(BusyReq* r) {
-	r->Req->WebSocketID = r->ID;
-	switch (r->WebSockType) {
-	case WebSocketFrameType::Binary: r->Req->Type = RequestType::WebSocketBinary; break;
-	case WebSocketFrameType::Text: r->Req->Type = RequestType::WebSocketText; break;
+bool Server::SendWebSocket(int64_t connectionID, RequestType type, const void* buf, size_t len) {
+	auto c = ConnectionFromID(connectionID);
+	if (c == nullptr)
+		return false;
+
+	WebSocketFrameType ft = WebSocketFrameType::Unknown;
+	switch (type) {
+	case RequestType::WebSocketBinary: ft = WebSocketFrameType::Binary; break;
+	case RequestType::WebSocketText: ft = WebSocketFrameType::Text; break;
+	case RequestType::WebSocketClose: ft = WebSocketFrameType::Close; break;
 	default:
 		assert(false);
+		return true;
 	}
-	Response w;
-	Handler(w, *r->Req);
-	if (w.Body.size() != 0) {
-		// Send back same type of frame that we received
-		SendWebSocketInternal(r->ID, r->Req->Type, w.Body.c_str(), w.Body.size());
+
+	byte  head[10];
+	byte* h = head;
+	*h++    = 0x80 | (byte) ft;
+	if (len < 126) {
+		*h++ = (byte) len;
+	} else if (len < 65536) {
+		*h++ = 126;
+		*h++ = (byte)(len >> 8);
+		*h++ = (byte) len;
+	} else {
+		*h++ = 127;
+		*h++ = (byte)(len >> 56);
+		*h++ = (byte)(len >> 48);
+		*h++ = (byte)(len >> 40);
+		*h++ = (byte)(len >> 32);
+		*h++ = (byte)(len >> 24);
+		*h++ = (byte)(len >> 16);
+		*h++ = (byte)(len >> 8);
+		*h++ = (byte) len;
 	}
+
+	string wbuf;
+	wbuf.append((char*) head, h - head);
+	wbuf.append((const char*) buf, len);
+
+	if (!SendBytes(c.get(), wbuf.c_str(), wbuf.size())) {
+		CloseConnection(c);
+		return false;
+	}
+
+	if (type == RequestType::WebSocketClose) {
+		// This is not strictly according to spec. According to spec, we should wait for the client to
+		// send a close frame too, and only then do we close the TCP socket.
+		CloseConnection(c);
+	}
+
+	return true;
 }
 
-void Server::DrainWebSocketOutQueue() {
-	while (true) {
-		WebSockOutMsg msg;
-		{
-			std::lock_guard<std::mutex> lock(WebSocketOutQueueLock);
-			if (WebSocketOutQueue.size() == 0)
-				return;
-			msg = WebSocketOutQueue.front();
-			WebSocketOutQueue.erase(WebSocketOutQueue.begin());
-		}
-		SendWebSocketInternal(msg.WebSocketID, msg.Type, msg.Buf, msg.Len);
-		free(msg.Buf);
-	}
+void Server::CloseWebSocket(int64_t connectionID, WebSocketCloseReason reason, const void* message, size_t messageLen) {
+	byte     code[2];
+	uint16_t r16 = (uint16_t) reason;
+	code[0]      = (byte)(r16 >> 8);
+	code[1]      = (byte)(r16);
+	string wbuf;
+	wbuf.append((const char*) code, 2);
+	if (message)
+		wbuf.append((const char*) message, messageLen);
+	SendWebSocket(connectionID, RequestType::WebSocketClose, wbuf.c_str(), wbuf.size());
 }
 
-bool Server::SendWebSocketInternal(int64_t websocketID, RequestType type, const void* buf, size_t len) {
-	for (auto r : Requests) {
-		if (r->ID == websocketID) {
-			WebSocketFrameType ft = WebSocketFrameType::Unknown;
-			switch (type) {
-			case RequestType::WebSocketBinary: ft = WebSocketFrameType::Binary; break;
-			case RequestType::WebSocketText: ft = WebSocketFrameType::Text; break;
-			default:
-				assert(false);
-				return false;
-			}
-
-			byte  head[10];
-			byte* h = head;
-			*h++    = 0x80 | (byte) ft;
-			if (len < 126) {
-				*h++ = (byte) len;
-			} else if (len < 65536) {
-				*h++ = 126;
-				*h++ = (byte)(len >> 8);
-				*h++ = (byte) len;
-			} else {
-				*h++ = 127;
-				*h++ = (byte)(len >> 56);
-				*h++ = (byte)(len >> 48);
-				*h++ = (byte)(len >> 40);
-				*h++ = (byte)(len >> 32);
-				*h++ = (byte)(len >> 24);
-				*h++ = (byte)(len >> 16);
-				*h++ = (byte)(len >> 8);
-				*h++ = (byte) len;
-			}
-
-			if (!SendBuffer(r, (const char*) head, h - head)) {
-				CloseRequest(r);
-				return false;
-			}
-
-			if (!SendBuffer(r, (const char*) buf, len)) {
-				CloseRequest(r);
-				return false;
-			}
-			return true;
-		}
-	}
-	return false;
-}
-
-bool Server::UpgradeToWebSocket(Response& w, BusyReq* r) {
-	std::string   buf = r->Req->Header("Sec-WebSocket-Key") + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+bool Server::UpgradeToWebSocket(Response& w, Connection* c) {
+	std::string   buf = w.Request->Header("Sec-WebSocket-Key") + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 	unsigned char hash[20];
 	phttp_sha1(hash, (const unsigned char*) buf.c_str(), (unsigned long) buf.size());
 	char hashb64[29];
 	Base64Encode(hash, sizeof(hash), hashb64);
 
-	SendHeadBuf.resize(0);
-	SendHeadBuf.append("HTTP/1.1 101 Switching Protocols\r\n");
-	SendHeadBuf.append("Upgrade: websocket\r\n");
-	SendHeadBuf.append("Connection: Upgrade\r\n");
-	SendHeadBuf.append("Sec-WebSocket-Accept: ");
-	SendHeadBuf.append(hashb64);
-	SendHeadBuf.append("\r\n");
+	string wbuf;
+	wbuf.resize(0);
+	wbuf.append("HTTP/1.1 101 Switching Protocols\r\n");
+	wbuf.append("Upgrade: websocket\r\n");
+	wbuf.append("Connection: Upgrade\r\n");
+	wbuf.append("Sec-WebSocket-Accept: ");
+	wbuf.append(hashb64);
+	wbuf.append("\r\n");
 	for (const auto& h : w.Headers) {
-		SendHeadBuf.append(h.first);
-		SendHeadBuf.append(": ");
-		SendHeadBuf.append(h.second);
-		SendHeadBuf.append("\r\n");
+		wbuf.append(h.first);
+		wbuf.append(": ");
+		wbuf.append(h.second);
+		wbuf.append("\r\n");
 	}
-	SendHeadBuf.append("\r\n");
+	wbuf.append("\r\n");
 
-	if (!SendBuffer(r, SendHeadBuf.c_str(), SendHeadBuf.size()))
+	if (!SendBytes(c, wbuf.c_str(), wbuf.size()))
 		return false;
 
-	r->IsWebSocket = true;
+	c->IsWebSocket = true;
 	return true;
 }
 
-bool Server::SendBuffer(BusyReq* r, const char* buf, size_t len) {
+bool Server::SendBytes(Connection* c, const char* buf, size_t len) {
 	size_t sent = 0;
 	while (sent != len) {
 		if (StopSignal)
 			return false;
 		size_t trySend = std::min(len - sent, (size_t) 1048576);
-		int    nsend   = send(r->Sock, buf + sent, (int) trySend, 0);
+		int    nsend   = send(c->Sock, buf + sent, (int) trySend, 0);
 		if (nsend < 0) {
-			WriteLog("[%5lld %5d] send error %d %d", (long long) r->ID, (int) r->Sock, nsend, LastError());
+			WriteLog("[%5lld %5d] send error %d %d", (long long) c->ID, (int) c->Sock, nsend, LastError());
 			return false;
 		} else if (nsend == 0) {
-			WriteLog("[%5lld %5d] socket closed on send", (long long) r->ID, (int) r->Sock);
+			WriteLog("[%5lld %5d] socket closed on send", (long long) c->ID, (int) c->Sock);
 			return false;
 		}
 		sent += nsend;
@@ -905,10 +977,10 @@ bool Server::SendBuffer(BusyReq* r, const char* buf, size_t len) {
 	return true;
 }
 
-bool Server::SendWebSocketPong(BusyReq* r) {
-	size_t pingSize = r->WebSockControlBody.size();
+bool Server::SendWebSocketPong(Connection* c) {
+	size_t pingSize = c->WebSockControlBody.size();
 	if (pingSize > 125) {
-		WriteLog("[%5lld %5d] websocket pong larger than 125 bytes (%lld)", (long long) r->ID, (int) r->Sock, (long long) pingSize);
+		WriteLog("[%5lld %5d] websocket pong larger than 125 bytes (%lld)", (long long) c->ID, (int) c->Sock, (long long) pingSize);
 		return false;
 	}
 
@@ -917,8 +989,8 @@ bool Server::SendWebSocketPong(BusyReq* r) {
 	uint8_t buf[2 + 125];
 	buf[0] = 0x8a;
 	buf[1] = (uint8_t) pingSize;
-	memcpy(buf + 2, r->WebSockControlBody.c_str(), pingSize);
-	return SendBuffer(r, (char*) buf, 2 + pingSize);
+	memcpy(buf + 2, c->WebSockControlBody.c_str(), pingSize);
+	return SendBytes(c, (char*) buf, 2 + pingSize);
 }
 
 // returns -1 on error
@@ -950,8 +1022,10 @@ bool Server::ParsePath(Request* r) {
 
 bool Server::ParseQuery(Request* r) {
 	using namespace std;
-	enum { Key,
-		   Value } state = Key;
+	enum {
+		Key,
+		Value,
+	} state = Key;
 
 	const char*          s   = r->RawQuery.c_str();
 	size_t               len = r->RawQuery.size();
@@ -1004,28 +1078,47 @@ void Server::WriteLog(const char* fmt, ...) {
 	Log->Log(buf);
 }
 
-void Server::CloseRequest(BusyReq* r) {
-	if (LogAllEvents)
-		WriteLog("[%5lld %5d] socket closing", (long long) r->ID, (int) r->Sock);
+Server::ConnectionPtr Server::ConnectionFromID(int64_t id) {
+	lock_guard<mutex> lock(ConnectionsLock);
+	auto              pos = ID2Connection.find(id);
+	if (pos != ID2Connection.end())
+		return pos->second;
+	return nullptr;
+}
 
-	bool   isWebSocket = r->IsWebSocket;
-	auto   sockID      = r->ID;
-	size_t i           = 0;
-	for (; i < Requests.size(); i++) {
-		if (Requests[i] == r)
-			break;
+void Server::CloseConnectionByID(int64_t id) {
+	ConnectionPtr c = ConnectionFromID(id);
+	if (c != nullptr)
+		CloseConnection(c);
+}
+
+void Server::CloseConnection(ConnectionPtr c) {
+	bool isWebSocket = c->IsWebSocket;
+	auto sockID      = c->ID;
+	{
+		lock_guard<mutex> lock(ConnectionsLock);
+		if (ID2Connection.find(c->ID) == ID2Connection.end()) {
+			// connection has already been closed
+			return;
+		}
+		size_t i = 0;
+		for (; i < Connections.size(); i++) {
+			if (Connections[i] == c)
+				break;
+		}
+		closesocket(c->Sock);
+		Sock2Connection.erase(c->Sock);
+		ID2Connection.erase(c->ID);
+		Connections.erase(Connections.begin() + i);
+		c->Request = nullptr;
 	}
-	assert(i != Requests.size());
-	Sock2Request.erase(r->Sock);
-	closesocket(r->Sock);
-	Requests.erase(Requests.begin() + i);
-	delete r->Req;
-	delete (http_parser*) r->Parser;
-	delete r;
-	if (isWebSocket) {
+	if (LogAllEvents)
+		WriteLog("[%5lld %5d] socket closed", (long long) c->ID, (int) c->Sock);
+	if (isWebSocket && Handler) {
+		// Notify synchronous ListenAndRun handler that websocket is closed
 		Request cr;
-		cr.Type        = RequestType::WebSocketClose;
-		cr.WebSocketID = sockID;
+		cr.Type         = RequestType::WebSocketClose;
+		cr.ConnectionID = sockID;
 		Response w;
 		Handler(w, cr);
 		if (w.Body.size() != 0 || w.Status != 0)
@@ -1034,7 +1127,7 @@ void Server::CloseRequest(BusyReq* r) {
 }
 
 void Server::Cleanup() {
-	std::lock_guard<std::mutex> lock(BigLock);
+	lock_guard<mutex> lock(ConnectionsLock);
 	if (ListenSock != InvalidSocket) {
 		int err = closesocket(ListenSock);
 		if (err == ErrSOCKET_ERROR)
@@ -1042,13 +1135,9 @@ void Server::Cleanup() {
 		ListenSock = InvalidSocket;
 	}
 
-	for (size_t i = 0; i < Requests.size(); i++) {
-		delete Requests[i]->Req;
-		delete (http_parser*) Requests[i]->Parser;
-		delete Requests[i];
-	}
-	Requests.clear();
-	Sock2Request.clear();
+	Connections.resize(0);
+	Sock2Connection.clear();
+	ID2Connection.clear();
 
 	if (ClosePipe[0])
 		close(ClosePipe[0]);
@@ -1056,54 +1145,54 @@ void Server::Cleanup() {
 		close(ClosePipe[1]);
 	memset(ClosePipe, 0, sizeof(ClosePipe));
 
-	free(Buf);
-	Buf      = nullptr;
-	BufCap   = 0;
-	BufStart = nullptr;
-	BufEnd   = nullptr;
+	free(RecvBuf);
+	RecvBuf      = nullptr;
+	RecvBufCap   = 0;
+	RecvBufStart = nullptr;
+	RecvBufEnd   = nullptr;
 }
 
 void Server::cb_http_field(void* data, const char* field, size_t flen, const char* value, size_t vlen) {
-	BusyReq* r = (BusyReq*) data;
-	r->Req->Headers.push_back({std::string(field, flen), std::string(value, vlen)});
+	Connection* c = (Connection*) data;
+	c->Request->Headers.push_back({std::string(field, flen), std::string(value, vlen)});
 
 	if (flen == 14 && EqualsNoCase(field, "content-length", 14))
-		r->Req->ContentLength = uatoi64(value, vlen);
+		c->Request->ContentLength = uatoi64(value, vlen);
 }
 
 void Server::cb_request_method(void* data, const char* at, size_t length) {
-	BusyReq* r = (BusyReq*) data;
-	r->Req->Method.assign(at, length);
+	Connection* c = (Connection*) data;
+	c->Request->Method.assign(at, length);
 }
 
 void Server::cb_request_uri(void* data, const char* at, size_t length) {
-	BusyReq* r = (BusyReq*) data;
-	r->Req->URI.assign(at, length);
+	Connection* c = (Connection*) data;
+	c->Request->URI.assign(at, length);
 }
 
 void Server::cb_fragment(void* data, const char* at, size_t length) {
-	BusyReq* r = (BusyReq*) data;
-	r->Req->Fragment.assign(at, length);
+	Connection* c = (Connection*) data;
+	c->Request->Fragment.assign(at, length);
 }
 
 void Server::cb_request_path(void* data, const char* at, size_t length) {
-	BusyReq* r = (BusyReq*) data;
-	r->Req->RawPath.assign(at, length);
+	Connection* c = (Connection*) data;
+	c->Request->RawPath.assign(at, length);
 }
 
 void Server::cb_query_string(void* data, const char* at, size_t length) {
-	BusyReq* r = (BusyReq*) data;
-	r->Req->RawQuery.assign(at, length);
+	Connection* c = (Connection*) data;
+	c->Request->RawQuery.assign(at, length);
 }
 
 void Server::cb_http_version(void* data, const char* at, size_t length) {
-	BusyReq* r = (BusyReq*) data;
-	r->Req->Version.assign(at, length);
+	Connection* c = (Connection*) data;
+	c->Request->Version.assign(at, length);
 }
 
 void Server::cb_header_done(void* data, const char* at, size_t length) {
-	BusyReq* r      = (BusyReq*) data;
-	r->IsHeaderDone = true;
+	Connection* c       = (Connection*) data;
+	c->IsHttpHeaderDone = true;
 }
 
 int Server::LastError() {

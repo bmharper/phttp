@@ -19,14 +19,18 @@ import (
 )
 
 const serverURl = "http://localhost:8080"
+const externalServer = true // Enable this when debugging C++ code
 
-type testFunc func(cx *context)
+type testFunc struct {
+	runMode string
+	f       func(cx *context)
+}
 
 func main() {
-	launch := func(testFunc func(cx *context)) bool {
-		name := strings.Split(getFunctionName(testFunc), ".")[1]
+	launch := func(tf testFunc) bool {
+		name := strings.Split(getFunctionName(tf.f), ".")[1]
 		fmt.Printf("%-20s ", name)
-		cx := newContext()
+		cx := newContext(tf.runMode)
 		defer func() bool {
 			cx.close()
 			if r := recover(); r != nil {
@@ -34,7 +38,7 @@ func main() {
 			}
 			return true
 		}()
-		testFunc(cx)
+		tf.f(cx)
 		fmt.Printf(" OK\n")
 		return true
 	}
@@ -53,7 +57,7 @@ func main() {
 	}()
 
 	tests := []testFunc{
-		TestBasic,
+		{"--ListenAndRun", TestBasic},
 	}
 
 	for _, t := range tests {
@@ -93,23 +97,29 @@ type context struct {
 	stdout io.ReadCloser
 }
 
-func newContext() *context {
+func newContext(runMode string) *context {
 	var err error
 	c := &context{}
-	c.server = exec.Command("./server")
-	c.server.Stdout = os.Stdout
-	err = c.server.Start()
-	if err != nil {
-		die(err)
+	if !externalServer {
+		c.server = exec.Command("./server")
+		c.server.Args = append(c.server.Args, runMode)
+		c.server.Stdout = os.Stdout
+		err = c.server.Start()
+		if err != nil {
+			die(err)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
-	time.Sleep(10 * time.Millisecond)
 	return c
 }
 
 func (c *context) close() {
 	if c.server != nil {
+		//fmt.Printf("Killing\n")
 		c.server.Process.Signal(os.Kill)
+		//c.server.Process.Kill()
 		c.server.Wait()
+		//fmt.Printf("Dead\n")
 	}
 }
 
@@ -134,7 +144,8 @@ func (c *context) getExpect(url string, statusCode int, responseBody string) {
 
 func TestBasic(cx *context) {
 	for i := 0; i < 5000; i++ {
-		//fmt.Printf("Get %v\n", i)
+		fmt.Printf("Get %v - ", i)
 		cx.getExpect("/", 200, "Hello")
+		fmt.Printf("have %v\n", i)
 	}
 }

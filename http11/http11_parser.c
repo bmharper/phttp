@@ -1,4 +1,4 @@
-
+// clang-format off
 #line 1 "http11_parser.rl"
 /**
  *
@@ -63,7 +63,7 @@ static const int http_parser_en_main = 1;
 
 #line 258 "http11_parser.rl"
 
-int phttp_parser_init(http_parser *parser) {
+int phttp_parser_init(phttp_parser *parser) {
   int cs = 0;
   
 #line 71 "http11_parser.c"
@@ -87,7 +87,7 @@ int phttp_parser_init(http_parser *parser) {
 
 
 /** exec **/
-size_t phttp_parser_execute(http_parser *parser, const char *buffer, size_t len, size_t off)  
+size_t phttp_parser_execute(phttp_parser *parser, const char *buffer, size_t len, size_t off)  
 {
   if(len == 0) return 0;
 
@@ -5917,7 +5917,7 @@ case 347:
   return(parser->nread);
 }
 
-int phttp_parser_finish(http_parser *parser)
+int phttp_parser_finish(phttp_parser *parser)
 {
   if (phttp_parser_has_error(parser) ) {
     return -1;
@@ -5928,10 +5928,10 @@ int phttp_parser_finish(http_parser *parser)
   }
 }
 
-int phttp_parser_has_error(http_parser *parser) {
+int phttp_parser_has_error(phttp_parser *parser) {
   return parser->cs == http_parser_error;
 }
 
-int phttp_parser_is_finished(http_parser *parser) {
+int phttp_parser_is_finished(phttp_parser *parser) {
   return parser->cs >= http_parser_first_final;
 }

@@ -32,6 +32,8 @@
 #include <unistd.h>
 #endif
 
+#include "http11/http11_parser.h"
+
 namespace phttp {
 
 enum StatusCode {
@@ -116,6 +118,17 @@ enum class WebSocketFrameType {
 	Unknown      = 16,
 };
 
+// See https://tools.ietf.org/html/rfc6455#section-7.4
+enum class WebSocketCloseReason {
+	Normal             = 1000, // eg channel has no further purpose
+	GoingAway          = 1001, // eg server is restarting
+	ProtocolError      = 1002, // eg unexpected message
+	UnableToHandleData = 1003, // eg image, when expecting text
+	InvalidData        = 1007, // eg non-UTF8 data in text
+	PolicyViolation    = 1008, // eg security violation
+	InternalError      = 1011, // eg db read failure
+};
+
 PHTTP_API bool Initialize();
 PHTTP_API void Shutdown();
 
@@ -125,7 +138,7 @@ class PHTTP_API Request {
 public:
 	RequestType                                      Type          = RequestType::Http;
 	size_t                                           ContentLength = 0; // Parsed from the Content-Length header
-	int64_t                                          WebSocketID   = 0; // Only valid if this is a websocket, or if IsWebSocketUpgrade() is true
+	int64_t                                          ConnectionID  = 0; // ID of the socket connection (but not literally the socket fd).
 	std::string                                      Version;
 	std::vector<std::pair<std::string, std::string>> Headers;
 	std::string                                      Method;
@@ -147,14 +160,19 @@ public:
 	bool        IsWebSocketClose() const { return Type == RequestType::WebSocketClose; }
 };
 
+typedef std::shared_ptr<Request> RequestPtr;
+
 /* A response to an HTTP request
 */
 class PHTTP_API Response {
 public:
+	RequestPtr                                       Request; // The request that originated this response
 	int                                              Status = 0;
 	std::vector<std::pair<std::string, std::string>> Headers;
 	std::string                                      Body;
 
+	Response();
+	Response(RequestPtr request);
 	size_t FindHeader(const std::string& header) const; // Returns the index of the first named header, or -1 if not found. Search is case-insensitive
 	void   SetHeader(const std::string& header, const std::string& val);
 	void   SetStatus(int status);
@@ -177,8 +195,7 @@ public:
 	void Log(const char* msg) override;
 };
 
-typedef std::shared_ptr<Logger>  LoggerPtr;
-typedef std::shared_ptr<Request> RequestPtr;
+typedef std::shared_ptr<Logger> LoggerPtr;
 
 class PHTTP_API Server {
 public:
@@ -190,46 +207,52 @@ public:
 	static const socket_t InvalidSocket = (socket_t)(~0);
 #endif
 
-	int               MaxRequests  = 1024; // You can raise this to 64k, but phttp makes no performance guarantees
-	LoggerPtr         Log          = nullptr;
-	bool              LogAllEvents = false; // If enabled, all socket events are logged
-	std::atomic<bool> StopSignal;           // Toggled by Stop()
+	int               MaxConnections = 4096; // You can raise this to 64k, but phttp makes no performance guarantees
+	LoggerPtr         Log            = nullptr;
+	bool              LogAllEvents   = false; // If enabled, all socket events are logged
+	std::atomic<bool> StopSignal;             // Toggled by Stop()
 
 	Server();
 
 	// Listen and Recv until we get the stop signal.
-	// This is the simplest way of using phttp, but you can only process a single response as a time.
+	// This is the simplest way of using phttp, but it is limited,
+	// because you can only process a single request as a time.
 	bool ListenAndRun(const char* bindAddress, int port, std::function<void(Response& w, Request& r)> handler);
 
 	// Start listening. Use in combination with Recv() to process incoming messages.
+	// Returns false if unable to bind to the address:port
 	bool Listen(const char* bindAddress, int port);
 
 	// Intended to be called from signal handlers, or another thread.
 	// This sets StopSignal to true, and closes the listening socket
 	void Stop();
 
-	// Wait for the next incoming message. This must only be called from a single thread,
+	// Wait for the next incoming message(s). This must only be called from a single thread,
 	// which is typically the same thread that called Listen().
-	// Returns nullptr if the stop signal has been received.
-	RequestPtr Recv();
+	// Returns an empty list if the stop signal has been received, or poll() returned
+	// an error.
+	std::vector<RequestPtr> Recv();
 
 	// Send an HTTP response. This can be called from multiple threads.
 	void SendHttp(Response& w);
 
-	// Send a websocket frame. Can be called from multiple threads.
+	// Send a websocket frame. This can be called from multiple threads.
 	// Returns false if the WebSocket channel has been closed
-	bool SendWebSocket(int64_t websocketID, RequestType type, const void* buf, size_t len);
+	bool SendWebSocket(int64_t connectionID, RequestType type, const void* buf, size_t len);
+
+	// Close a websocket connection. This can be called from multiple threads.
+	void CloseWebSocket(int64_t connectionID, WebSocketCloseReason reason, const void* message = nullptr, size_t messageLen = 0);
 
 private:
 	// This represents a socket, which is initially opened for an HTTP request,
 	// but may be recycled for future HTTP requests, or upgraded to a websocket.
-	struct BusyReq {
-		socket_t    Sock         = InvalidSocket;
-		int64_t     ID           = 0; // ID of the channel
-		void*       Parser       = nullptr;
-		bool        IsHeaderDone = false;
-		Request*    Req          = nullptr;
-		std::string HttpHeadBuf; // Buffer of HTTP header
+	struct Connection {
+		socket_t     Sock = InvalidSocket;
+		int64_t      ID   = 0; // ID of the channel
+		phttp_parser Parser;   // HTTP request parser state
+		bool         IsHttpHeaderDone = false;
+		RequestPtr   Request;
+		std::string  HttpHeadBuf; // Buffer of HTTP header
 
 		// WebSocket state
 		bool               IsWebSocket        = false;
@@ -247,64 +270,46 @@ private:
 		bool IsWebSockControlFrame() const { return !!((uint8_t) WebSockType & 8); }
 	};
 
-	// A websocket message that has been queued for sending
-	struct WebSockOutMsg {
-		int64_t     WebSocketID = 0;
-		RequestType Type        = RequestType::WebSocketBinary;
-		void*       Buf         = nullptr;
-		size_t      Len         = 0;
-	};
+	typedef std::shared_ptr<Connection> ConnectionPtr;
 
-	std::mutex                                   BigLock; // Guards everything in here, except for StopSignal
 	socket_t                                     ListenSock = InvalidSocket;
 	int                                          ClosePipe[2]; // Used on linux to wake poll()
-	std::function<void(Response& w, Request& r)> Handler;
-	std::vector<BusyReq*>                        Requests;
-	std::unordered_map<socket_t, BusyReq*>       Sock2Request; // Map from socket to request
-	int64_t                                      NextReqID       = 1;
-	int64_t                                      NextWebSocketID = 1;
-	size_t                                       BufCap          = 0;       // Capacity of Buf
-	uint8_t*                                     BufStart        = nullptr; // First byte in buffer
-	uint8_t*                                     BufEnd          = nullptr; // One past last byte in buffer. Amount of data in Buf is BufEnd - BufStart.
-	uint8_t*                                     Buf             = nullptr; // Buffer that is used for incoming data. Reset after every recv().
-	std::string                                  SendHeadBuf;
+	std::function<void(Response& w, Request& r)> Handler;      // Synchronous event handler for ListenAndRun()
 
-	// Queue of websocket messages waiting to be sent.
-	// Why do we need this? We need this because of our extremely simple BigLock, which is held while processing
-	// incoming messages. It is a frequent use case to send a websocket message while processing an HTTP request,
-	// or a websocket frame. However, during that processing, BigLock is held, so we would end up in a deadlock if
-	// we tried to send the message immediately. Instead, we queue up that message, to be sent after processing
-	// any incoming messages. It's unfortunate that we're adding this delay in sending, but right now it feels
-	// like the simplest acceptable solution.
-	// Note that there is one bug in this solution. When we go to sleep on poll(), in our main Run loop, we could
-	// have items inside this queue. This wouldn't be sent until we got woken up. The correct solution is to
-	// make our locking finer grained.
-	std::mutex                 WebSocketOutQueueLock;
-	std::vector<WebSockOutMsg> WebSocketOutQueue;
+	std::mutex                                  ConnectionsLock; // Guards Connections, Sock2Connection, NextReqID
+	std::vector<ConnectionPtr>                  Connections;
+	std::unordered_map<socket_t, ConnectionPtr> Sock2Connection; // Map from socket to connection
+	std::unordered_map<int64_t, ConnectionPtr>  ID2Connection;   // Map from ID to connection
 
-	void Run();
-	void Cleanup();
-	void Accept();
-	void CloseRequest(BusyReq* r);
+	std::atomic<int64_t> NextReqID; // Starts at 1
+
+	// Buffer that is used by Recv()
+	size_t   RecvBufCap   = 0;       // Capacity of RecvBuf
+	uint8_t* RecvBufStart = nullptr; // First byte in buffer
+	uint8_t* RecvBufEnd   = nullptr; // One past last byte in buffer. Amount of data in Buf is BufEnd - BufStart.
+	uint8_t* RecvBuf      = nullptr; // Buffer that is used for incoming data. Reset after every recv().
+
+	void          Cleanup();
+	void          AcceptOrReject();
+	ConnectionPtr ConnectionFromID(int64_t id);
+	void          CloseConnection(ConnectionPtr c);
+	void          CloseConnectionByID(int64_t id);
 	// Generally, if a function returns false, then we must close the socket
-	bool ReadFromRequest(BusyReq* r);
-	bool ReadFromWebSocket(BusyReq* r);
-	bool ReadFromWebSocketLoop(BusyReq* r);
-	bool ReadFromHttpRequest(BusyReq* r);
-	bool ReadWebSocketHead(BusyReq* r);
-	bool DispatchToHandler(BusyReq* r);
-	void DispatchWebSocketFrame(BusyReq* r);
-	void DrainWebSocketOutQueue();
-	bool SendWebSocketInternal(int64_t websocketID, RequestType type, const void* buf, size_t len); // Assumes BigLock is already held
-	bool UpgradeToWebSocket(Response& w, BusyReq* r);
-	void ReadWebSocketBody(BusyReq* r);
-	bool SendBuffer(BusyReq* r, const char* buf, size_t len);
-	bool SendWebSocketPong(BusyReq* r);
+	bool ReadFromConnection(Connection* c, RequestPtr& r);
+	bool ReadFromWebSocket(Connection* c, RequestPtr& r);
+	bool ReadFromWebSocketLoop(Connection* c, RequestPtr& r);
+	bool ReadFromHttpRequest(Connection* c, RequestPtr& r);
+	bool ReadWebSocketHead(Connection* c);
+	bool UpgradeToWebSocket(Response& w, Connection* c);
+	void ReadWebSocketBody(Connection* c);
+	bool SendHttpInternal(Response& w);
+	bool SendBytes(Connection* c, const char* buf, size_t len);
+	bool SendWebSocketPong(Connection* c);
 	bool ParsePath(Request* r);
 	bool ParseQuery(Request* r);
 	void WriteLog(const char* fmt, ...);
 
-	size_t BufLen() const { return BufEnd - BufStart; }
+	size_t RecvBufLen() const { return RecvBufEnd - RecvBufStart; }
 
 	// http_parser callbacks
 	static void cb_http_field(void* data, const char* field, size_t flen, const char* value, size_t vlen);
