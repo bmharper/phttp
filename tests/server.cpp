@@ -1,10 +1,14 @@
+#define _CRT_SECURE_NO_WARNINGS 1
 #include "../phttp.h"
 #include <string.h>
 #include <string>
 #include <thread>
+#include <atomic>
 #include "sema.h"
 
-#ifndef _WIN32
+#ifdef _WIN32
+#pragma comment(lib, "Ws2_32.lib")
+#else
 #include <signal.h>
 #endif
 
@@ -50,9 +54,12 @@ void sleepnano(int64_t nanoseconds) {
 #endif
 
 void RunSingleThread(phttp::Server& s) {
-	s.ListenAndRun(BindAddress, Port, [](phttp::Response& w, phttp::Request& r) {
+	s.ListenAndRun(BindAddress, Port, [&s](phttp::Response& w, phttp::Request& r) {
 		if (r.Path == "/") {
 			w.SetStatusAndBody(200, "Hello");
+		} else if (r.Path == "/kill") {
+			w.SetStatus(200);
+			s.Stop();
 		} else if (r.Path == "/echo") {
 			w.SetStatusAndBody(200, r.Body);
 		} else if (r.Path == "/echo-method") {
@@ -90,19 +97,118 @@ private:
 	Semaphore                 Sem;
 };
 
-void ProcessingThread(Queue* q, phttp::Server* s) {
+struct ServerState {
+	atomic<bool> Exit;
+	Queue        Q;
+
+	mutex                       WSLock;     // Guards access to all websocket state
+	unordered_map<int64_t, int> WSLastRecv; // Key = websocket ID. Value = latest number received from client
+};
+
+void Die(const char* fmt, ...) {
+	printf("C++ failure: ");
+	va_list va;
+	va_start(va, fmt);
+	vprintf(fmt, va);
+	va_end(va);
+	printf("\n\n");
+	exit(1);
+}
+
+void ProcessWSFrame(ServerState* ss, phttp::RequestPtr r) {
+	// Ensure that the value coming in is greater than the previous value that we received.
+	// Also verify that the websocket ID is known to us
+	lock_guard<mutex> lock(ss->WSLock);
+	int               val = atoi(r->Body.c_str());
+	if (ss->WSLastRecv.find(r->ConnectionID) == ss->WSLastRecv.end()) {
+		printf("Received value %d on unknown websocket id %d (occurs sometimes at start)", val, (int) r->ConnectionID);
+		return;
+	}
+
+	int prev = ss->WSLastRecv[r->ConnectionID];
+	if (val <= prev) {
+		Die("Received invalid value %d on websocket id %d. Expected higher than %d", val, (int) r->ConnectionID, prev);
+	} else {
+		ss->WSLastRecv[r->ConnectionID] = val;
+	}
+}
+
+void WebSocketPubThread(ServerState* ss, phttp::Server* s) {
+	// This is a thread that just continually sends out websocket messages
+
+	size_t rr           = 0; // round-robin counter
+	size_t nFailedSends = 0;
+
+	while (!ss->Exit) {
+		int ms = 1000 * 1000;
+		sleepnano(1 * ms);
+
+		{
+			lock_guard<mutex> lock(ss->WSLock);
+			if (ss->WSLastRecv.size() != 0) {
+				// round-robin through all of the active web sockets
+				int64_t conID = 0;
+				int     val   = 0;
+				size_t  i     = 0;
+				size_t  j     = rr % ss->WSLastRecv.size();
+				for (auto p : ss->WSLastRecv) {
+					if (i == j) {
+						conID = p.first;
+						val   = p.second;
+						break;
+					}
+					i++;
+				}
+				rr++;
+				char buf[20];
+				sprintf(buf, "%d", val);
+				//printf("Sent to websocket %d: %d\n", (int) conID, val);
+				if (!s->SendWebSocket(conID, phttp::RequestType::WebSocketText, buf, strlen(buf))) {
+					nFailedSends++;
+					if (nFailedSends > 10)
+						printf("%d failed sends: Sent to websocket %d, but it was already closed (expected to happen sometimes, but not often)\n", (int) nFailedSends, (int) conID);
+				}
+			}
+		}
+	}
+}
+
+void ProcessingThread(ServerState* ss, phttp::Server* s) {
 	while (!s->StopSignal) {
-		auto r = q->Pop();
-		if (!r)
+		auto r = ss->Q.Pop();
+		if (!r) {
+			// null request means quit
 			break;
+		}
 
 		phttp::Response w(r);
-		if (r->Path == "/echo-method") {
+		if (r->IsWebSocketUpgrade()) {
+			//printf("Upgrade %d to WebSocket\n", (int) r->ConnectionID);
+			w.Status = 200;
+			// assume client proposed only one protocol, and if so, reply that we're accepting it
+			if (r->Header("Sec-WebSocket-Protocol") != "")
+				w.SetHeader("Sec-WebSocket-Protocol", r->Header("Sec-WebSocket-Protocol"));
+			s->SendHttp(w);
+			lock_guard<mutex> lock(ss->WSLock);
+			ss->WSLastRecv.insert({r->ConnectionID, -1});
+		} else if (r->IsWebSocketClose()) {
+			lock_guard<mutex> lock(ss->WSLock);
+			ss->WSLastRecv.erase(r->ConnectionID);
+		} else if (r->IsWebSocketFrame()) {
+			ProcessWSFrame(ss, r);
+		} else if (r->Path == "/echo-method") {
 			w.SetStatusAndBody(200, r->Method + "-MT-" + r->Body);
+			s->SendHttp(w);
+		} else if (r->Path == "/kill") {
+			//printf("Received kill\n");
+			w.SetStatus(200);
+			s->SendHttp(w);
+			s->Stop();
+			//printf("Stopping\n");
 		} else {
 			w.SetStatus(404);
+			s->SendHttp(w);
 		}
-		s->SendHttp(w);
 	}
 }
 
@@ -112,29 +218,31 @@ int RunMultiThread(phttp::Server& s) {
 		return 1;
 	}
 
-	int            nthread = 4;
+	//s.LogAllEvents = true;
+
+	int            nProcessingThreads = 2;
 	vector<thread> threads;
-	Queue          q;
-	for (int i = 0; i < nthread; i++) {
-		threads.push_back(thread(ProcessingThread, &q, &s));
+	ServerState    ss;
+	ss.Exit = false;
+	for (int i = 0; i < nProcessingThreads; i++) {
+		threads.push_back(thread(ProcessingThread, &ss, &s));
 	}
+	threads.push_back(thread(WebSocketPubThread, &ss, &s));
 
 	while (true) {
 		auto queue = s.Recv();
 		if (queue.size() == 0)
 			break;
-		for (auto r : queue) {
-			if (r->IsHttp()) {
-				q.Push(r);
-			}
-		}
+		for (auto r : queue)
+			ss.Q.Push(r);
 	}
+	ss.Exit = true;
 
 	// wake up the threads, and get them to exit
-	for (int i = 0; i < nthread; i++)
-		q.Push(nullptr);
+	for (int i = 0; i < threads.size(); i++)
+		ss.Q.Push(nullptr);
 
-	for (int i = 0; i < nthread; i++) {
+	for (int i = 0; i < threads.size(); i++) {
 		threads[i].join();
 	}
 
@@ -155,6 +263,8 @@ int main(int argc, char** argv) {
 	s.LogInitialListen = false;
 	s.Log              = log;
 	//s.LogAllEvents  = true;
+
+	phttp::Initialize();
 
 	if (runMode == "--ListenAndRun") {
 		RunSingleThread(s);

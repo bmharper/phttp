@@ -147,7 +147,7 @@ int main(int argc, char** argv) {
 			// assume client proposed only one protocol, and if so, reply that we're accepting it
 			if (r.Header("Sec-WebSocket-Protocol") != "")
 				w.SetHeader("Sec-WebSocket-Protocol", r.Header("Sec-WebSocket-Protocol"));
-			wsID = r.WebSocketID;
+			wsID = r.ConnectionID;
 			return;
 		}
 

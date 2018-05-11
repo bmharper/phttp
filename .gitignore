@@ -1,6 +1,10 @@
 *.VC.db
 *.VC.opendb
 *.vcxproj.user
+*.obj
+*.exe
+*.ilk
+*.pdb
 .vs
 msvc/Debug
 msvc/Release

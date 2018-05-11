@@ -234,7 +234,8 @@ double Request::QueryDbl(const char* key) const {
 bool Request::IsWebSocketUpgrade() const {
 	// Chrome  (59) sends Connection: Upgrade
 	// Firefox (53) sends Connection: keep-alive, Upgrade
-	return Header("Upgrade") == "websocket" &&
+	return IsHttp() &&
+	       Header("Upgrade") == "websocket" &&
 	       Header("Connection").find("Upgrade") != -1;
 }
 
@@ -288,7 +289,7 @@ PHTTP_API void Shutdown() {
 }
 
 // Returns true on success, or false if there was an error
-static bool SetNonBlocking(int fd) {
+static bool SetNonBlocking(Server::socket_t fd) {
 	bool blocking = false;
 #ifdef _WIN32
 	unsigned long mode = blocking ? 0 : 1;
@@ -522,7 +523,7 @@ void Server::AcceptOrReject() {
 	// writes, so that they're sufficiently large. We make sure that we buffer up where we can.
 	// On a spot test on my Ubuntu 16.04 machine, I saw a delay of 40ms with NODELAY switched off (the default setting).
 	int optval = 1;
-	setsockopt(newSock, IPPROTO_TCP, TCP_NODELAY, (void*) &optval, sizeof(optval));
+	setsockopt(newSock, IPPROTO_TCP, TCP_NODELAY, (const char*) &optval, sizeof(optval));
 
 	ConnectionPtr con = make_shared<Connection>();
 	con->Sock         = newSock;
@@ -1015,7 +1016,8 @@ bool Server::UpgradeToWebSocket(Response& w, Connection* c) {
 }
 
 bool Server::SendBytes(Connection* c, const char* buf, size_t len) {
-	size_t sent = 0;
+	std::lock_guard<std::mutex> lock(c->SendLock);
+	size_t                      sent = 0;
 	while (sent != len) {
 		if (StopSignal)
 			return false;
@@ -1039,8 +1041,6 @@ bool Server::SendWebSocketPong(Connection* c) {
 		WriteLog("[%5lld %5d] websocket pong larger than 125 bytes (%lld)", (long long) c->ID, (int) c->Sock, (long long) pingSize);
 		return false;
 	}
-
-	// Assume that the PING did not fragment a request that was busy being sent
 
 	uint8_t buf[2 + 125];
 	buf[0] = 0x8a;

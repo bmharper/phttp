@@ -1,7 +1,13 @@
 package main
 
-// When iterating on these tests, do:
+// When iterating on these tests:
+// Unix:
 //   make -s server && go run test.go
+//
+// Windows
+//   # uncomment the windows section in 'Makefile', and then:
+//   wsl make -s server.exe && go run test.go
+//
 // To benchmark with ab:
 //   make server && ./server --Concurrent
 //   ab -k -n 10000 -c 4 http://localhost:8080/echo-method
@@ -18,11 +24,15 @@ import (
 	"reflect"
 	"runtime"
 	"runtime/pprof"
+	"strconv"
 	"strings"
 	"time"
+
+	"github.com/gorilla/websocket"
 )
 
 const serverURL = "http://localhost:8080"
+const serverURL_WS = "ws://localhost:8080"
 const externalServer = false // Enable this when debugging C++ code
 const enableProfile = false
 
@@ -67,6 +77,7 @@ func main() {
 		{"--ListenAndRun", TestBasic},
 		{"--ListenAndRun", TestMethods},
 		{"--Concurrent", TestConcurrency},
+		{"--Concurrent", TestWebSocket},
 	}
 
 	for _, t := range tests {
@@ -125,10 +136,17 @@ func newContext(runMode string) *context {
 func (c *context) close() {
 	if c.server != nil {
 		//fmt.Printf("Killing\n")
+		// I don't know how else to send a kill signal to a windows process, so we reserve
+		// a special HTTP message for that.
+		c.client.Get(serverURL + "/kill")
+		time.Sleep(100 * time.Millisecond)
 		c.server.Process.Signal(os.Kill)
 		//c.server.Process.Kill()
 		c.server.Wait()
-		//fmt.Printf("Dead\n")
+		//fmt.Printf("Dead (exit code %v)\n", c.server.ProcessState.Success())
+		if !c.server.ProcessState.Success() {
+			dieMsgf("C++ server process exited with non-zero success code")
+		}
 	}
 }
 
@@ -206,4 +224,129 @@ func TestConcurrency(cx *context) {
 	}
 	//duration := time.Now().Sub(start)
 	//fmt.Printf("\n  Requests per second: %v\n", int(float64(num*nthread)/duration.Seconds()))
+}
+
+type WebSocket struct {
+	id       int
+	con      *websocket.Conn
+	lastSent int
+	lastRecv int
+	numPongs int
+}
+
+func TestWebSocket(cx *context) {
+	dial := websocket.Dialer{}
+	socks := []*WebSocket{}
+
+	n := 5 // keep this a prime number to make round-robinning easy
+	for i := 0; i < n; i++ {
+		con, _, err := dial.Dial(serverURL_WS, http.Header{})
+		if err != nil {
+			dieMsgf("Failed to connect to websocket: %v", err)
+		}
+		ws := &WebSocket{
+			id:       i + 1,
+			con:      con,
+			lastSent: -1,
+			lastRecv: -1,
+			numPongs: 0,
+		}
+		pongHandler := func(appData string) error {
+			expect := fmt.Sprintf("ping-%v", ws.id)
+			if appData != expect {
+				dieMsgf("Received unexpected pong (expect %v, received %v)", expect, appData)
+			}
+			ws.numPongs++
+			return nil
+		}
+		con.SetPongHandler(pongHandler)
+		socks = append(socks, ws)
+	}
+
+	done := make(chan bool)
+
+	// These two don't need to be tied together. The server keeps sending messages until we kill it.
+	numRecv := 1000
+	numWrite := 1000
+
+	// reader thread
+	go func() {
+		for i := 0; i < numRecv; i++ {
+			if len(socks) == 0 {
+				break
+			}
+			sock := socks[i%len(socks)]
+			mtype, r, err := sock.con.NextReader()
+			if err != nil {
+				dieMsgf("Failed to get NextReader: %v", err)
+			}
+			if mtype != websocket.TextMessage {
+				dieMsgf("Expected text message (1), but got: %v", mtype)
+			}
+			buf, err := ioutil.ReadAll(r)
+			if err != nil {
+				dieMsgf("Error reading from websocket: %v", err)
+			}
+			val, _ := strconv.ParseInt(string(buf), 10, 64)
+			if int(val) < sock.lastRecv {
+				dieMsgf("Server sent value smaller than previous (%v < %v)", val, sock.lastRecv)
+			}
+			sock.lastRecv = int(val)
+			//fmt.Printf("Recv from %v: %v\n", sock.id, val)
+		}
+		done <- true
+	}()
+
+	// writer thread
+	go func() {
+		for i := 0; i < numWrite; i++ {
+			sock := socks[i%len(socks)]
+			var err error
+			var w io.WriteCloser
+			var msg string
+			if i%13 == 0 {
+				// Ping
+				w, err = sock.con.NextWriter(websocket.PingMessage)
+				if err != nil {
+					dieMsgf("Error getting writer for ping: %v", err)
+				}
+				msg = fmt.Sprintf("ping-%v", sock.id)
+			} else {
+				// Text Message
+				w, err = sock.con.NextWriter(websocket.TextMessage)
+				if err != nil {
+					dieMsgf("Error getting writer: %v", err)
+				}
+				sock.lastSent++
+				msg = fmt.Sprintf("%v", sock.lastSent)
+			}
+			n, err := w.Write([]byte(msg))
+			if err != nil || n != len(msg) {
+				dieMsgf("Error writing to websocket (%v, %v)", err, n)
+			}
+			w.Close()
+			//fmt.Printf("Sent to %v: %v\n", sock.id, sock.lastSent)
+		}
+
+		done <- true
+	}()
+
+	// wait for reader & writer to finish
+	<-done
+	<-done
+
+	for i := 0; i < len(socks); i++ {
+		// gracefactor is here to allow for less sent messages than numWrite / n, because some messages are pings, and
+		// round robin might not reach all sockets equally.
+		sock := socks[i]
+		graceFactor := 3
+		expectRecv := numWrite / (n * graceFactor)
+		if sock.lastRecv < expectRecv {
+			dieMsgf("Socket %v: Expected to receive at least %v from server, but only got %v", sock.id, expectRecv, sock.lastRecv)
+		}
+		if sock.numPongs == 0 {
+			dieMsgf("Socket %v received no pongs", sock.id)
+		}
+		sock.con.Close()
+	}
 }

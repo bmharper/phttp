@@ -102,7 +102,7 @@ enum StatusCode {
 };
 
 enum class RequestType {
-	Http,            // HTTP message
+	Http,            // HTTP message (which can be a websocket upgrade)
 	WebSocketBinary, // Binary WebSocket frame
 	WebSocketText,   // Text WebSocket frame
 	WebSocketClose,  // WebSocket is closing. You cannot send any response to this.
@@ -274,6 +274,7 @@ private:
 		bool            IsHttpHeaderDone = false; // Toggled once Parser tells us that it's finished parsing the header
 		RequestPtr      Request;                  // Associated request
 		std::string     HttpHeadBuf;              // Buffer of HTTP header. The parser design needs to have the entire header in memory until it's finished.
+		std::mutex      SendLock;                 // Used by the server to ensure that only a single thread is writing to the socket at a time
 
 		// WebSocket state
 		bool               HaveWebSockHead    = false;
