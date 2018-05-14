@@ -102,7 +102,10 @@ enum StatusCode {
 };
 
 enum class RequestType {
-	Http,            // HTTP message (which can be a websocket upgrade)
+	Null = 0, // Invalid value
+	Http,     // HTTP request, or a part of it
+	//HttpComplete,    // Complete HTTP request (entire body is inside 'Body')
+	//HttpChunk,       // Chunk of an HTTP request (not necessarily Chunked-Transfer encoding. Could be part of an upload)
 	WebSocketBinary, // Binary WebSocket frame
 	WebSocketText,   // Text WebSocket frame
 	WebSocketClose,  // WebSocket is closing. You cannot send any response to this.
@@ -136,29 +139,47 @@ PHTTP_API void Shutdown();
 */
 class PHTTP_API Request {
 public:
-	RequestType                                      Type          = RequestType::Http;
-	size_t                                           ContentLength = 0; // Parsed from the Content-Length header
-	int64_t                                          ConnectionID  = 0; // ID of the socket connection (but not literally the socket fd).
-	std::string                                      Version;
-	std::vector<std::pair<std::string, std::string>> Headers;
-	std::string                                      Method;
-	std::string                                      URI;
-	std::string                                      RawPath;  // Path before performing URL unescaping
-	std::string                                      Path;     // Path with URL unescaping (ie %20 -> 32)
-	std::string                                      Fragment; // The portion of the URL after the first #
-	std::string                                      RawQuery; // The portion of the URL after the first ?
-	std::vector<std::pair<std::string, std::string>> Query;    // Parsed key+value pairs from RawQuery
-	std::string                                      Body;     // Body of HTTP request, or WebSocket frame
+	typedef std::vector<std::pair<std::string, std::string>> StrPairList;
+
+	RequestType Type          = RequestType::Null;
+	size_t      ContentLength = 0;     // Parsed from the Content-Length header
+	int64_t     ConnectionID  = 0;     // ID of the socket connection (but not literally the socket fd).
+	bool        IsChunked     = false; // True if this is a chunked request
+	std::string Version;               // "HTTP/1.0" or "HTTP/1.1"
+	StrPairList Headers;
+	std::string Method;
+	std::string URI;
+	std::string RawPath;  // Path before performing URL unescaping
+	std::string Path;     // Path with URL unescaping (ie %20 -> char(32))
+	std::string Fragment; // The portion of the URL after the first #
+	std::string RawQuery; // The portion of the URL after the first ?
+	StrPairList Query;    // Parsed key+value pairs from RawQuery
 
 	Request(int64_t connectionID);
-	std::string Header(const char* h) const;     // Returns first header found, or empty string. Header name match is case-insensitive
-	std::string QueryVal(const char* key) const; // Returns first value found, or empty string
-	int         QueryInt(const char* key) const; // Returns first value found, or zero
-	double      QueryDbl(const char* key) const; // Returns first value found, or zero
+	std::string Header(const char* h) const;                                         // Returns first header found, or empty string. Header name match is case-insensitive
+	std::string QueryVal(const char* key) const;                                     // Returns first value found, or empty string
+	int         QueryInt(const char* key) const;                                     // Returns first value found, or zero
+	double      QueryDbl(const char* key) const;                                     // Returns first value found, or zero
+	size_t      ReadBody(size_t start, void* dst, size_t maxLen, bool clear);        // Attempt to read maxLen bytes out of Body, starting at 'start'. Return number of bytes read. If clear, then erase bytes after reading.
+	size_t      ReadBody(size_t start, std::string& dst, size_t maxLen, bool clear); // Attempt to read maxLen bytes out of Body, starting at 'start', and append to 'dst'. Return number of bytes read. If clear, then erase bytes after reading.
+	void        WriteBody(const void* buf, size_t len, bool isLastChunk);            // Append data to Body
+	size_t      BodyBytesReceived();                                                 // Returns number of body bytes received so far
+	bool        IsHttpBodyFinished();                                                // Returns true if the final chunk of HTTP body data has been received
 	bool        IsWebSocketUpgrade() const;
 	bool        IsHttp() const { return Type == RequestType::Http; }
-	bool        IsWebSocketFrame() const { return Type == RequestType::WebSocketBinary || Type == RequestType::WebSocketText; }
-	bool        IsWebSocketClose() const { return Type == RequestType::WebSocketClose; }
+	bool        IsHttpFinal() { return Type == RequestType::Http && IsHttpBodyFinished(); }
+	//bool        IsHttp() const { return Type == RequestType::HttpComplete || Type == RequestType::HttpChunk; }
+	//bool        IsHttpComplete() const { return Type == RequestType::HttpComplete; }
+	//bool        IsHttpChunk() const { return Type == RequestType::HttpChunk; }
+	//bool IsFinalHttpChunk() const { return Type == RequestType::HttpChunk && Chunk.size() == 0; }
+	bool IsWebSocketFrame() const { return Type == RequestType::WebSocketBinary || Type == RequestType::WebSocketText; }
+	bool IsWebSocketClose() const { return Type == RequestType::WebSocketClose; }
+
+private:
+	std::mutex  BodyLock;             // Guards access to Body, BodyWritten, BodyFinished
+	std::string Body;                 // Body of HTTP request, or WebSocket frame
+	size_t      BodyWritten  = 0;     // Number of bytes written to Body
+	bool        BodyFinished = false; // Toggled when we receive our final chunk of an HTTP request
 };
 
 typedef std::shared_ptr<Request> RequestPtr;
@@ -197,6 +218,9 @@ public:
 };
 
 typedef std::shared_ptr<Logger> LoggerPtr;
+
+//struct ChunkedDecoderState {
+//};
 
 /* phttp Server
 
@@ -275,6 +299,9 @@ private:
 		RequestPtr      Request;                  // Associated request
 		std::string     HttpHeadBuf;              // Buffer of HTTP header. The parser design needs to have the entire header in memory until it's finished.
 		std::mutex      SendLock;                 // Used by the server to ensure that only a single thread is writing to the socket at a time
+		std::string     ChunkHead;                // Stores the most recently received chunk head
+		size_t          ChunkReceived = 0;        // Number of bytes that we have received for the current chunk
+		//ChunkedDecoderState ChunkState;               // State of the chunked request decoder
 
 		// WebSocket state
 		bool               HaveWebSockHead    = false;
@@ -322,6 +349,7 @@ private:
 	bool ReadFromWebSocket(Connection* c, RequestPtr& r);
 	bool ReadFromWebSocketLoop(Connection* c, RequestPtr& r);
 	bool ReadFromHttpRequest(Connection* c, RequestPtr& r);
+	bool ReadHttpChunkedBody(Connection* c, const void* buf, size_t len);
 	bool ReadWebSocketHead(Connection* c);
 	bool UpgradeToWebSocket(Response& w, Connection* c);
 	void ReadWebSocketBody(Connection* c);
@@ -331,6 +359,8 @@ private:
 	bool ParsePath(Request* r);
 	bool ParseQuery(Request* r);
 	void WriteLog(const char* fmt, ...);
+	bool ParseChunkHead(Connection* c, const char* buf, size_t len, uint32_t& chunkSize);
+	bool HaveChunkHead(Connection* c);
 
 	size_t RecvBufLen() const { return RecvBufEnd - RecvBufStart; }
 

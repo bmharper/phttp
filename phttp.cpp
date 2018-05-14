@@ -231,6 +231,50 @@ double Request::QueryDbl(const char* key) const {
 	return 0;
 }
 
+size_t Request::ReadBody(size_t start, void* dst, size_t maxLen, bool clear) {
+	lock_guard<mutex> lock(BodyLock);
+	if (start >= Body.size())
+		return 0;
+	maxLen = std::min(Body.size() - start, maxLen);
+	if (maxLen == 0)
+		return 0;
+	memcpy(dst, Body.data() + start, maxLen);
+	if (clear)
+		memmove((char*) Body.data() + start, Body.data() + start + maxLen, Body.size() - (start + maxLen));
+	return maxLen;
+}
+
+size_t Request::ReadBody(size_t start, std::string& dst, size_t maxLen, bool clear) {
+	lock_guard<mutex> lock(BodyLock);
+	if (start >= Body.size())
+		return 0;
+	maxLen = std::min(Body.size() - start, maxLen);
+	if (maxLen == 0)
+		return 0;
+	dst.append(Body.data() + start, maxLen);
+	if (clear)
+		memmove((char*) Body.data() + start, Body.data() + start + maxLen, Body.size() - (start + maxLen));
+	return maxLen;
+}
+
+void Request::WriteBody(const void* buf, size_t len, bool isLastChunk) {
+	lock_guard<mutex> lock(BodyLock);
+	Body.append((const char*) buf, len);
+	BodyWritten += len;
+	if ((IsChunked && isLastChunk) || (!IsChunked && BodyWritten == ContentLength))
+		BodyFinished = true;
+}
+
+size_t Request::BodyBytesReceived() {
+	lock_guard<mutex> lock(BodyLock);
+	return BodyWritten;
+}
+
+bool Request::IsHttpBodyFinished() {
+	lock_guard<mutex> lock(BodyLock);
+	return BodyFinished;
+}
+
 bool Request::IsWebSocketUpgrade() const {
 	// Chrome  (59) sends Connection: Upgrade
 	// Firefox (53) sends Connection: keep-alive, Upgrade
@@ -478,10 +522,10 @@ std::vector<RequestPtr> Server::Recv() {
 					auto              con = Sock2Connection.find(fds[i].fd);
 					if (con == Sock2Connection.end()) {
 						WriteLog("Received data on unknown socket [%5d]", (int) fds[i].fd);
-						char buf[1000];
-						int  nread = recv(fds[i].fd, buf, sizeof(buf), 0);
-						buf[nread] = 0;
-						printf("buf:\n%s\n", buf);
+						//char buf[1000];
+						//int  nread = recv(fds[i].fd, buf, sizeof(buf), 0);
+						//buf[nread] = 0;
+						//printf("buf:\n%s\n", buf);
 						continue;
 					}
 					c = con->second;
@@ -541,7 +585,7 @@ void Server::AcceptOrReject() {
 
 bool Server::ReadFromConnection(Connection* c, RequestPtr& r) {
 	if (c->State == ConnectionState::HttpSend) {
-		// We are not ready to receive a request. This is illegal (this would be "pipelining", but that never
+		// We are not ready to receive a request. This is illegal (it is actually HTTP 1.1 "pipelining", but that never
 		// came into use, and was replaced by HTTP/2).
 		if (LogAllEvents)
 			WriteLog("[%5lld %5d] socket recv while in HttpSend state", (long long) c->ID, (int) c->Sock);
@@ -749,7 +793,8 @@ void Server::ReadWebSocketBody(Connection* c) {
 }
 
 bool Server::ReadFromHttpRequest(Connection* c, RequestPtr& r) {
-	auto parser = &c->Parser;
+	auto parser            = &c->Parser;
+	bool wasHttpHeaderDone = c->IsHttpHeaderDone;
 	if (!c->IsHttpHeaderDone) {
 		c->HttpHeadBuf.append((const char*) RecvBufStart, RecvBufLen());
 		size_t oldPos = parser->nread;
@@ -771,11 +816,8 @@ bool Server::ReadFromHttpRequest(Connection* c, RequestPtr& r) {
 	// WebSockets are full duplex, which is why their implementation is more complex.
 
 	// It is normal for IsHttpHeaderDone to be true now, even through it was false in the above block
-	if (c->IsHttpHeaderDone && RecvBufLen() != 0)
-		c->Request->Body.append((const char*) RecvBufStart, RecvBufLen());
 
-	bool ok = true;
-	if (c->IsHttpHeaderDone && c->Request->Body.size() == c->Request->ContentLength) {
+	if (!wasHttpHeaderDone && c->IsHttpHeaderDone) {
 		// HTTP request is ready to be consumed
 		if (!ParsePath(c->Request.get()))
 			WriteLog("[%5lld %5d] path parse failed: '%s'", (long long) c->ID, (int) c->Sock, c->Request->RawPath.c_str());
@@ -783,11 +825,103 @@ bool Server::ReadFromHttpRequest(Connection* c, RequestPtr& r) {
 		if (!ParseQuery(c->Request.get()))
 			WriteLog("[%5lld %5d] query parse failed: '%s'", (long long) c->ID, (int) c->Sock, c->Request->RawQuery.c_str());
 
-		r        = c->Request;
-		c->State = ConnectionState::HttpSend;
+		c->Request->IsChunked = c->Request->Header("Transfer-Encoding").find("chunked") != -1;
 	}
 
-	return ok;
+	if (c->IsHttpHeaderDone) {
+		if (c->Request->IsChunked) {
+			if (!ReadHttpChunkedBody(c, RecvBufStart, RecvBufLen()))
+				return false;
+		} else {
+			c->Request->WriteBody(RecvBufStart, RecvBufLen(), false);
+		}
+
+		r = c->Request;
+		if (c->Request->IsHttpBodyFinished())
+			c->State = ConnectionState::HttpSend;
+	}
+
+	return true;
+}
+
+bool Server::ReadHttpChunkedBody(Connection* c, const void* _buf, size_t _len) {
+	// As we consume '_buf', we increment 'buf', and decrement 'len'
+	// Before returning from this function, we MUST consume all the bytes in 'buf'
+	size_t      len = _len;
+	const char* buf = (const char*) _buf;
+	while (true) {
+		if (HaveChunkHead(c)) {
+			// We are busy reading a chunk. Continue doing so until we've read it all
+			uint32_t chunkSize = 0;
+			if (!ParseChunkHead(c, c->ChunkHead.c_str(), c->ChunkHead.size(), chunkSize))
+				return false;
+			size_t maxRead = min(len, chunkSize - c->ChunkReceived);
+			c->Request->WriteBody(buf, maxRead, chunkSize == 0);
+			buf += maxRead;
+			len -= maxRead;
+			c->ChunkReceived += maxRead;
+			if (c->ChunkReceived == chunkSize) {
+				// reset for next chunk (this path is also triggered when we receive the final chunk)
+				c->ChunkReceived = 0;
+				c->ChunkHead.clear();
+			}
+		} else {
+			// Consume 'buf' until we have a potentially valid chunk head
+			while (len != 0 && !HaveChunkHead(c)) {
+				c->ChunkHead += *buf;
+				buf++;
+				len--;
+			}
+			if (!HaveChunkHead(c) && c->ChunkHead.size() > 1024) {
+				WriteLog("[%5lld %5d] Chunk head too long (max 1024 bytes)", (long long) c->ID, (int) c->Sock);
+				return false;
+			}
+			if (!HaveChunkHead(c)) {
+				// We have consumed 'buf' entirely, but still don't have a complete chunk head
+				return true;
+			}
+		}
+	}
+	return true;
+}
+
+// Returns true if c->ChunkHead is at least 3 bytes, and ends with \r\n
+bool Server::HaveChunkHead(Connection* c) {
+	const std::string& head = c->ChunkHead;
+	size_t             size = head.size();
+	return size >= 3 && head[size - 2] == '\r' && head[size - 1] == '\n';
+}
+
+// This function assumes that 'buf' ends with \r\n
+bool Server::ParseChunkHead(Connection* c, const char* buf, size_t len, uint32_t& chunkSize) {
+	// HaveChunkHead() checks for this condition
+	assert(len >= 3 && buf[len - 2] == '\r' && buf[len - 1] == '\n');
+
+	uint64_t size64 = 0;
+	for (size_t i = 0; i < len - 2; i++) {
+		char     c     = buf[i];
+		uint64_t digit = 0;
+		if (c >= '0' && c <= '9')
+			digit = c - '0';
+		else if (c >= 'a' && c <= 'z')
+			digit = c - 'a';
+		else if (c >= 'A' && c <= 'Z')
+			digit = c - 'A';
+		else if (c == ';')
+			break;
+		else {
+			WriteLog("[%5lld %5d] Invalid character %d in chunk head (%.*s)", (long long) c->ID, (int) c->Sock, (int) c, (int) len, buf);
+			return false;
+		}
+		size64 = size64 * 16 + digit;
+		if (size64 > (uint64_t) 4294967296) {
+			WriteLog("[%5lld %5d] Chunk size too large (max 4294967296 bytes) (%.*s)", (long long) c->ID, (int) c->Sock, (int) len, buf);
+			return false;
+		}
+	}
+
+	chunkSize = (uint32_t) size64;
+	return true;
 }
 
 void Server::SendHttp(Response& w) {
