@@ -134,6 +134,21 @@ static void MakeDate(char* buf) {
 	sprintf(buf, "%s, %02d %s %04d %02d:%02d:%02d GMT", WeekDay[m.tm_wday], m.tm_mday, Months[m.tm_mon], m.tm_year + 1900, m.tm_hour, m.tm_min, m.tm_sec);
 }
 
+static int64_t atoi64(const char* s, size_t len = -1) {
+	if (len == 0)
+		return 0;
+	size_t i        = 0;
+	bool   negative = false;
+	if (s[i] == '-') {
+		negative = true;
+		i++;
+	}
+	int64_t v = 0;
+	for (; s[i] && i < len; i++)
+		v = v * 10 + (s[i] - '0');
+	return negative ? -v : v;
+}
+
 static uint64_t uatoi64(const char* s, size_t len) {
 	uint64_t v = 0;
 	for (size_t i = 0; i < len; i++)
@@ -213,6 +228,14 @@ int Request::QueryInt(const char* key) const {
 	for (const auto& p : Query) {
 		if (p.first == key)
 			return atoi(p.second.c_str());
+	}
+	return 0;
+}
+
+int64_t Request::QueryInt64(const char* key) const {
+	for (const auto& p : Query) {
+		if (p.first == key)
+			return atoi64(p.second.c_str());
 	}
 	return 0;
 }

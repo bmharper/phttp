@@ -135,10 +135,11 @@ public:
 	std::vector<std::pair<std::string, std::string>> Query; // Parse key+value pairs from QueryString
 	std::string                                      Body;  // Body of HTTP or WebSocket request
 
-	std::string Header(const char* h) const;     // Returns first header found, or empty string. Header name match is case-insensitive
-	std::string QueryVal(const char* key) const; // Returns first value found, or empty string
-	int         QueryInt(const char* key) const; // Returns first value found, or zero
-	double      QueryDbl(const char* key) const; // Returns first value found, or zero
+	std::string Header(const char* h) const;       // Returns first header found, or empty string. Header name match is case-insensitive
+	std::string QueryVal(const char* key) const;   // Returns first value found, or empty string
+	int         QueryInt(const char* key) const;   // Returns first value found, or zero
+	int64_t     QueryInt64(const char* key) const; // Returns first value found, or zero
+	double      QueryDbl(const char* key) const;   // Returns first value found, or zero
 	bool        IsWebSocketUpgrade() const;
 	bool        IsHttp() const { return Type == RequestType::Http; }
 	bool        IsWebSocketFrame() const { return Type == RequestType::WebSocketBinary || Type == RequestType::WebSocketText; }
