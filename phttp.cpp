@@ -21,6 +21,10 @@
 #pragma warning(disable : 4996) // sprintf
 #endif
 
+#ifdef __APPLE__
+#include <signal.h>
+#endif
+
 typedef unsigned char byte;
 
 namespace phttp {
@@ -465,6 +469,12 @@ void Server::Accept() {
 		WriteLog("accept() failed: %d", LastError());
 		return;
 	}
+	// For linux, we use MSG_NOSIGNAL whenever we issue a send()
+#ifdef __APPLE__
+	// never tested!
+	int noSigPipe = 1;
+	setsockopt(newSock, SOL_SOCKET, SO_NOSIGPIPE, &noSigPipe, sizeof(noSigPipe));
+#endif
 	BusyReq* req      = new BusyReq();
 	req->Sock         = newSock;
 	req->ID           = NextReqID++;
@@ -903,12 +913,16 @@ bool Server::SendBuffer(BusyReq* r, const char* buf, size_t len) {
 		if (StopSignal)
 			return false;
 		size_t trySend = std::min(len - sent, (size_t) 1048576);
-		int    nsend   = send(r->Sock, buf + sent, (int) trySend, 0);
+		int    flags   = 0;
+#ifdef __linux__
+		flags |= MSG_NOSIGNAL;
+#endif
+		int nsend = send(r->Sock, buf + sent, (int) trySend, flags);
 		if (nsend < 0) {
 			WriteLog("[%5lld %5d] send error %d %d", (long long) r->ID, (int) r->Sock, nsend, LastError());
 			return false;
 		} else if (nsend == 0) {
-			WriteLog("[%5lld %5d] socket closed on send", (long long) r->ID, (int) r->Sock);
+			WriteLog("[%5lld %5d] socket closed on send (%d)", (long long) r->ID, (int) r->Sock, LastError());
 			return false;
 		}
 		sent += nsend;
