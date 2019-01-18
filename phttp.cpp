@@ -257,12 +257,22 @@ size_t Request::ReadBody(size_t start, std::string& dst, size_t maxLen, bool cle
 	return maxLen;
 }
 
-void Request::WriteBody(const void* buf, size_t len, bool isLastChunk) {
+void Request::ClearBody() {
+	lock_guard<mutex> lock(BodyLock);
+	Body.resize(0);
+}
+
+void Request::WriteWebSocketBody(const void* buf, size_t len) {
+	lock_guard<mutex> lock(BodyLock);
+	Body.append((const char*) buf, len);
+}
+
+void Request::WriteHttpBody(const void* buf, size_t len, bool isLastHttpChunk) {
 	lock_guard<mutex> lock(BodyLock);
 	Body.append((const char*) buf, len);
 	BodyWritten += len;
-	if ((IsChunked && isLastChunk) || (!IsChunked && BodyWritten == ContentLength))
-		BodyFinished = true;
+	if ((IsChunked && isLastHttpChunk) || (!IsChunked && BodyWritten == ContentLength))
+		HttpBodyFinished = true;
 }
 
 size_t Request::BodyBytesReceived() {
@@ -272,7 +282,7 @@ size_t Request::BodyBytesReceived() {
 
 bool Request::IsHttpBodyFinished() {
 	lock_guard<mutex> lock(BodyLock);
-	return BodyFinished;
+	return HttpBodyFinished;
 }
 
 bool Request::IsWebSocketUpgrade() const {
@@ -688,7 +698,7 @@ bool Server::ReadFromWebSocketLoop(Connection* c, RequestPtr& r) {
 				r          = c->Request;
 				c->Request = make_shared<Request>(c->ID);
 			}
-			c->Request->Body.resize(0);
+			c->Request->ClearBody();
 		}
 		// Reset to receive another frame
 		c->HaveWebSockHead    = false;
@@ -777,17 +787,15 @@ bool Server::ReadWebSocketHead(Connection* c) {
 }
 
 void Server::ReadWebSocketBody(Connection* c) {
-	std::string& body = c->IsWebSockControlFrame() ? c->WebSockControlBody : c->Request->Body;
-
 	size_t nread = std::min<size_t>(RecvBufLen(), c->WebSockPayloadLen - c->WebSockPayloadRecv);
-	byte*  buf   = RecvBufStart;
-	char   mask[4];
-	memcpy(mask, c->WebSockMask, 4);
-	uint32_t mp = c->WebSockMaskPos;
-	for (size_t i = 0; i < nread; i++, mp = (mp + 1) & 3)
-		body += buf[i] ^ mask[mp];
 
-	c->WebSockMaskPos = mp;
+	_UnmaskBuffer(RecvBufStart, nread, c->WebSockMask, c->WebSockMaskPos);
+
+	if (c->IsWebSockControlFrame())
+		c->WebSockControlBody.append((char*) RecvBufStart, nread);
+	else
+		c->Request->WriteWebSocketBody(RecvBufStart, nread);
+
 	c->WebSockPayloadRecv += nread;
 	RecvBufStart += nread;
 }
@@ -833,7 +841,7 @@ bool Server::ReadFromHttpRequest(Connection* c, RequestPtr& r) {
 			if (!ReadHttpChunkedBody(c, RecvBufStart, RecvBufLen()))
 				return false;
 		} else {
-			c->Request->WriteBody(RecvBufStart, RecvBufLen(), false);
+			c->Request->WriteHttpBody(RecvBufStart, RecvBufLen(), false);
 		}
 
 		r = c->Request;
@@ -856,7 +864,7 @@ bool Server::ReadHttpChunkedBody(Connection* c, const void* _buf, size_t _len) {
 			if (!ParseChunkHead(c, c->ChunkHead.c_str(), c->ChunkHead.size(), chunkSize))
 				return false;
 			size_t maxRead = min(len, chunkSize - c->ChunkReceived);
-			c->Request->WriteBody(buf, maxRead, chunkSize == 0);
+			c->Request->WriteHttpBody(buf, maxRead, chunkSize == 0);
 			buf += maxRead;
 			len -= maxRead;
 			c->ChunkReceived += maxRead;
@@ -899,18 +907,18 @@ bool Server::ParseChunkHead(Connection* c, const char* buf, size_t len, uint32_t
 
 	uint64_t size64 = 0;
 	for (size_t i = 0; i < len - 2; i++) {
-		char     c     = buf[i];
+		char     ch    = buf[i];
 		uint64_t digit = 0;
-		if (c >= '0' && c <= '9')
-			digit = c - '0';
-		else if (c >= 'a' && c <= 'z')
-			digit = c - 'a';
-		else if (c >= 'A' && c <= 'Z')
-			digit = c - 'A';
-		else if (c == ';')
+		if (ch >= '0' && ch <= '9')
+			digit = ch - '0';
+		else if (ch >= 'a' && ch <= 'z')
+			digit = ch - 'a';
+		else if (ch >= 'A' && ch <= 'Z')
+			digit = ch - 'A';
+		else if (ch == ';')
 			break;
 		else {
-			WriteLog("[%5lld %5d] Invalid character %d in chunk head (%.*s)", (long long) c->ID, (int) c->Sock, (int) c, (int) len, buf);
+			WriteLog("[%5lld %5d] Invalid character %d in chunk head (%.*s)", (long long) c->ID, (int) c->Sock, (int) ch, (int) len, buf);
 			return false;
 		}
 		size64 = size64 * 16 + digit;
@@ -1113,6 +1121,32 @@ void Server::CloseWebSocket(int64_t connectionID, WebSocketCloseReason reason, c
 	if (message)
 		wbuf.append((const char*) message, messageLen);
 	SendWebSocket(connectionID, RequestType::WebSocketClose, wbuf.c_str(), wbuf.size());
+}
+
+void Server::_UnmaskBuffer(uint8_t* buf, size_t bufLen, uint8_t* mask, uint32_t& maskPos) {
+	uint32_t mp = maskPos & 3;
+
+	byte* bufEnd = buf + bufLen;
+
+	// process until rbuf is 4 byte aligned
+	for (; ((size_t) buf & 3) != 0 && buf < bufEnd; buf++, mp = (mp + 1) & 3)
+		*buf ^= mask[mp];
+
+	byte* bufEndDown4 = (byte*) (((size_t) bufEnd) & ~3);
+	// unmask in 4 byte chunks
+	uint32_t mask32 = 0;
+	mask32          = (mask32 << 8) | mask[(mp + 3) & 3];
+	mask32          = (mask32 << 8) | mask[(mp + 2) & 3];
+	mask32          = (mask32 << 8) | mask[(mp + 1) & 3];
+	mask32          = (mask32 << 8) | mask[mp & 3];
+	for (; buf < bufEndDown4; buf += 4)
+		*((uint32_t*) buf) ^= mask32;
+
+	// process remaining 1, 2, or 3 bytes
+	for (; buf < bufEnd; buf++, mp = (mp + 1) & 3)
+		*buf ^= mask[mp];
+
+	maskPos = mp;
 }
 
 bool Server::UpgradeToWebSocket(Response& w, Connection* c) {
