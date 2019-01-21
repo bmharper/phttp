@@ -196,7 +196,7 @@ static void Base64Encode(const uint8_t* raw, size_t len, char* enc) {
 	enc[0] = 0;
 }
 
-Request::Request(int64_t connectionID) : ConnectionID(connectionID) {
+Request::Request(int64_t connectionID, RequestType type) : ConnectionID(connectionID), Type(type) {
 }
 
 std::string Request::Header(const char* h) const {
@@ -283,6 +283,19 @@ size_t Request::BodyBytesReceived() {
 bool Request::IsHttpBodyFinished() {
 	lock_guard<mutex> lock(BodyLock);
 	return HttpBodyFinished;
+}
+
+const std::string* Request::HttpBody() {
+	lock_guard<mutex> lock(BodyLock);
+	if (!HttpBodyFinished)
+		return nullptr;
+	return &Body;
+}
+
+const std::string& Request::Frame() {
+	if (Type != RequestType::WebSocketBinary && Type != RequestType::WebSocketText)
+		return EmptyString;
+	return Body;
 }
 
 bool Request::IsWebSocketUpgrade() const {
@@ -582,7 +595,7 @@ void Server::AcceptOrReject() {
 	ConnectionPtr con = make_shared<Connection>();
 	con->Sock         = newSock;
 	con->ID           = NextReqID++;
-	con->Request      = make_shared<Request>(con->ID);
+	con->Request      = make_shared<Request>(con->ID, RequestType::Http);
 	{
 		lock_guard<mutex> lock(ConnectionsLock);
 		Connections.push_back(con);
@@ -695,8 +708,9 @@ bool Server::ReadFromWebSocketLoop(Connection* c, RequestPtr& r) {
 				default:
 					assert(false);
 				}
+				// Return this request to the caller, and setup the connection to receive a new request
 				r          = c->Request;
-				c->Request = make_shared<Request>(c->ID);
+				c->Request = make_shared<Request>(c->ID, RequestType::Null);
 			}
 			c->Request->ClearBody();
 		}
@@ -764,7 +778,7 @@ bool Server::ReadWebSocketHead(Connection* c) {
 		                       ((uint64_t) buf[8] << 8) |
 		                       ((uint64_t) buf[9]);
 		bytesOfLen = 9;
-		assert(c->WebSockPayloadLen < 1000000);
+		//assert(c->WebSockPayloadLen < 1000000);
 	}
 
 	if (bytesOfLen == 0)
@@ -787,7 +801,7 @@ bool Server::ReadWebSocketHead(Connection* c) {
 }
 
 void Server::ReadWebSocketBody(Connection* c) {
-	size_t nread = std::min<size_t>(RecvBufLen(), c->WebSockPayloadLen - c->WebSockPayloadRecv);
+	size_t nread = std::min<size_t>(RecvBufLen(), size_t(c->WebSockPayloadLen - c->WebSockPayloadRecv));
 
 	_UnmaskBuffer(RecvBufStart, nread, c->WebSockMask, c->WebSockMaskPos);
 
@@ -939,7 +953,7 @@ void Server::SendHttp(Response& w) {
 
 bool Server::SendHttpInternal(Response& w) {
 	// This wouldn't be a constant if we supported chunked responses, or transmitting a response bit by bit.
-	bool isFinalResponse = true;
+	const bool isFinalResponse = true;
 
 	if (w.Request->Method == "HEAD" && w.Body.size() != 0) {
 		WriteLog("HEAD response may not contain a body");
@@ -1045,7 +1059,7 @@ void Server::ResetForAnotherHttpRequest(ConnectionPtr c) {
 	auto oldID          = c->ID;
 	c->State            = ConnectionState::HttpRecv;
 	c->ID               = NextReqID++;
-	c->Request          = make_shared<Request>(c->ID);
+	c->Request          = make_shared<Request>(c->ID, RequestType::Http);
 	c->IsHttpHeaderDone = false;
 	phttp_parser_init(&c->Parser);
 	if (LogAllEvents)
@@ -1082,15 +1096,16 @@ bool Server::SendWebSocket(int64_t connectionID, RequestType type, const void* b
 		*h++ = (byte)(len >> 8);
 		*h++ = (byte) len;
 	} else {
-		*h++ = 127;
-		*h++ = (byte)(len >> 56);
-		*h++ = (byte)(len >> 48);
-		*h++ = (byte)(len >> 40);
-		*h++ = (byte)(len >> 32);
-		*h++ = (byte)(len >> 24);
-		*h++ = (byte)(len >> 16);
-		*h++ = (byte)(len >> 8);
-		*h++ = (byte) len;
+		uint64_t len64 = len;
+		*h++           = 127;
+		*h++           = (byte)(len64 >> 56);
+		*h++           = (byte)(len64 >> 48);
+		*h++           = (byte)(len64 >> 40);
+		*h++           = (byte)(len64 >> 32);
+		*h++           = (byte)(len64 >> 24);
+		*h++           = (byte)(len64 >> 16);
+		*h++           = (byte)(len64 >> 8);
+		*h++           = (byte) len64;
 	}
 
 	string wbuf;
@@ -1111,6 +1126,10 @@ bool Server::SendWebSocket(int64_t connectionID, RequestType type, const void* b
 	return true;
 }
 
+bool Server::SendWebSocket(int64_t connectionID, RequestType type, const std::string& buf) {
+	return SendWebSocket(connectionID, type, buf.c_str(), buf.size());
+}
+
 void Server::CloseWebSocket(int64_t connectionID, WebSocketCloseReason reason, const void* message, size_t messageLen) {
 	byte     code[2];
 	uint16_t r16 = (uint16_t) reason;
@@ -1121,6 +1140,11 @@ void Server::CloseWebSocket(int64_t connectionID, WebSocketCloseReason reason, c
 	if (message)
 		wbuf.append((const char*) message, messageLen);
 	SendWebSocket(connectionID, RequestType::WebSocketClose, wbuf.c_str(), wbuf.size());
+}
+
+void Server::CloseWebSocket(int64_t connectionID, WebSocketCloseReason reason, const std::string& message) {
+	bool haveMessage = message.size() != 0;
+	CloseWebSocket(connectionID, reason, haveMessage ? message.c_str() : nullptr, haveMessage ? message.size() : 0);
 }
 
 void Server::_UnmaskBuffer(uint8_t* buf, size_t bufLen, uint8_t* mask, uint32_t& maskPos) {
@@ -1381,8 +1405,11 @@ void Server::cb_http_field(void* data, const char* field, size_t flen, const cha
 	Connection* c = (Connection*) data;
 	c->Request->Headers.push_back({std::string(field, flen), std::string(value, vlen)});
 
-	if (flen == 14 && EqualsNoCase(field, "content-length", 14))
-		c->Request->ContentLength = uatoi64(value, vlen);
+	if (flen == 14 && EqualsNoCase(field, "content-length", 14)) {
+		uint64_t clen = uatoi64(value, vlen);
+		// what to do if ContentLength is greater than 4GB on 32-bit? I don't know.
+		c->Request->ContentLength = (size_t) clen;
+	}
 }
 
 void Server::cb_request_method(void* data, const char* at, size_t length) {

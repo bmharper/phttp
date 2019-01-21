@@ -11,38 +11,35 @@
     </Filter>
     <Filter Include="Resource Files">
       <UniqueIdentifier>{67DA6AB6-F800-4c08-8B7A-83BB121AAD01}</UniqueIdentifier>
-      <Extensions>rc;ico;cur;bmp;dlg;rc2;rct;bin;rgs;gif;jpg;jpeg;jpe;resx;tiff;tif;png;wav;mfcribbon-ms</Extensions>
-    </Filter>
-    <Filter Include="http11">
-      <UniqueIdentifier>{657433a5-b4d2-4cbc-ba0f-0446487ee4c3}</UniqueIdentifier>
+      <Extensions>rc;ico;cur;bmp;dlg;rc2;rct;bin;rgs;gif;jpg;jpeg;jpe;resx;tiff;tif;png;wav</Extensions>
     </Filter>
   </ItemGroup>
   <ItemGroup>
-    <ClCompile Include="..\demo.cpp">
+    <ClCompile Include="..\..\phttp.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="..\http11\http11_parser.c">
-      <Filter>http11</Filter>
-    </ClCompile>
-    <ClCompile Include="..\phttp.cpp">
+    <ClCompile Include="..\..\sha1.c">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="..\sha1.c">
+    <ClCompile Include="..\..\http11\http11_parser.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\tests\unit.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
   </ItemGroup>
   <ItemGroup>
-    <ClInclude Include="..\http11\http11_common.h">
-      <Filter>http11</Filter>
+    <ClInclude Include="..\..\phttp.h">
+      <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="..\http11\http11_parser.h">
-      <Filter>http11</Filter>
+    <ClInclude Include="..\..\sha1.h">
+      <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="..\phttp.h">
-      <Filter>Source Files</Filter>
+    <ClInclude Include="..\..\http11\http11_common.h">
+      <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="..\sha1.h">
-      <Filter>Source Files</Filter>
+    <ClInclude Include="..\..\http11\http11_parser.h">
+      <Filter>Header Files</Filter>
     </ClInclude>
   </ItemGroup>
 </Project>

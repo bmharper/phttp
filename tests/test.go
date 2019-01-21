@@ -9,7 +9,7 @@ package main
 //   wsl make -s server.exe && go run test.go
 //
 // To benchmark with ab:
-//   make server && ./server --Concurrent
+//   make server && ./server --concurrent
 //   ab -k -n 10000 -c 4 http://localhost:8080/echo-method
 
 import (
@@ -76,8 +76,8 @@ func main() {
 	tests := []testFunc{
 		{"--ListenAndRun", TestBasic},
 		{"--ListenAndRun", TestMethods},
-		{"--Concurrent", TestConcurrency},
-		{"--Concurrent", TestWebSocket},
+		{"--concurrent", TestConcurrency},
+		{"--concurrent", TestWebSocket},
 	}
 
 	for _, t := range tests {

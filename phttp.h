@@ -153,27 +153,30 @@ public:
 	std::string RawQuery;              // The portion of the URL after the first ?
 	StrPairList Query;                 // Parsed key+value pairs from RawQuery
 
-	Request(int64_t connectionID);
-	std::string Header(const char* h) const;                                         // Returns first header found, or empty string. Header name match is case-insensitive
-	std::string QueryVal(const char* key) const;                                     // Returns first value found, or empty string
-	int         QueryInt(const char* key) const;                                     // Returns first value found, or zero
-	double      QueryDbl(const char* key) const;                                     // Returns first value found, or zero
-	size_t      ReadBody(size_t start, void* dst, size_t maxLen, bool clear);        // Attempt to read maxLen bytes out of Body, starting at 'start'. Return number of bytes read. If clear, then erase bytes after reading.
-	size_t      ReadBody(size_t start, std::string& dst, size_t maxLen, bool clear); // Attempt to read maxLen bytes out of Body, starting at 'start', and append to 'dst'. Return number of bytes read. If clear, then erase bytes after reading.
-	void        ClearBody();                                                         // Reset Body to an empty buffer
-	void        WriteWebSocketBody(const void* buf, size_t len);                     // Append WebSocket data to Body
-	void        WriteHttpBody(const void* buf, size_t len, bool isLastHttpChunk);    // Append HTTP data to Body
-	size_t      BodyBytesReceived();                                                 // Returns number of body bytes received so far
-	bool        IsHttpBodyFinished();                                                // Returns true if the final chunk of HTTP body data has been received
-	bool        IsWebSocketUpgrade() const;
-	bool        IsHttp() const { return Type == RequestType::Http; }
-	bool        IsHttpFinal() { return Type == RequestType::Http && IsHttpBodyFinished(); }
-	bool        IsWebSocketFrame() const { return Type == RequestType::WebSocketBinary || Type == RequestType::WebSocketText; }
-	bool        IsWebSocketClose() const { return Type == RequestType::WebSocketClose; }
+	Request(int64_t connectionID, RequestType type);
+	std::string        Header(const char* h) const;                                         // Returns first header found, or empty string. Header name match is case-insensitive
+	std::string        QueryVal(const char* key) const;                                     // Returns first value found, or empty string
+	int                QueryInt(const char* key) const;                                     // Returns first value found, or zero
+	double             QueryDbl(const char* key) const;                                     // Returns first value found, or zero
+	size_t             ReadBody(size_t start, void* dst, size_t maxLen, bool clear);        // Attempt to read maxLen bytes out of Body, starting at 'start'. Return number of bytes read. If clear, then erase bytes after reading.
+	size_t             ReadBody(size_t start, std::string& dst, size_t maxLen, bool clear); // Attempt to read maxLen bytes out of Body, starting at 'start', and append to 'dst'. Return number of bytes read. If clear, then erase bytes after reading.
+	void               ClearBody();                                                         // Reset Body to an empty buffer
+	void               WriteWebSocketBody(const void* buf, size_t len);                     // Append WebSocket data to Body
+	void               WriteHttpBody(const void* buf, size_t len, bool isLastHttpChunk);    // Append HTTP data to Body
+	size_t             BodyBytesReceived();                                                 // Returns number of body bytes received so far
+	bool               IsHttpBodyFinished();                                                // Returns true if the final chunk of HTTP body data has been received
+	const std::string* HttpBody();                                                          // Returns a pointer to the complete request HTTP body, or NULL if the request is still being sent
+	const std::string& Frame();                                                             // Returns the contents of the WebSocket frame, or an empty string if this is not a WebSocket frame
+	bool               IsWebSocketUpgrade() const;
+	bool               IsHttp() const { return Type == RequestType::Http; }
+	bool               IsHttpFinal() { return Type == RequestType::Http && IsHttpBodyFinished(); }
+	bool               IsWebSocketFrame() const { return Type == RequestType::WebSocketBinary || Type == RequestType::WebSocketText; }
+	bool               IsWebSocketClose() const { return Type == RequestType::WebSocketClose; }
 
 private:
-	std::mutex  BodyLock;                 // Guards access to Body, BodyWritten, BodyFinished
+	std::mutex  BodyLock;                 // Guards access to Body, BodyWritten, HttpBodyFinished
 	std::string Body;                     // Body of HTTP request, or WebSocket frame
+	std::string EmptyString;              // Special empty string
 	size_t      BodyWritten      = 0;     // Number of bytes written to Body
 	bool        HttpBodyFinished = false; // Toggled when we receive our final chunk of an HTTP request
 };
@@ -235,7 +238,7 @@ public:
 	static const socket_t InvalidSocket = (socket_t)(~0);
 #endif
 
-	int               MaxConnections   = 4096; // You can raise this to 64k, but phttp makes no performance guarantees
+	int               MaxConnections   = 4096; // You can raise this to 64k, but our use of poll() makes high socket numbers expensive
 	LoggerPtr         Log              = nullptr;
 	bool              LogAllEvents     = false; // If enabled, all socket events are logged
 	bool              LogInitialListen = true;  // Log initial bind
@@ -256,8 +259,8 @@ public:
 	// This sets StopSignal to true, and closes the listening socket
 	void Stop();
 
-	// Wait for the next incoming message(s). This must only be called from a single thread,
-	// which is typically the same thread that called Listen().
+	// Wait for the next incoming message(s).
+	// This must only be called from a single thread, which is typically the same thread that called Listen().
 	// Returns an empty list if the stop signal has been received, or poll() returned
 	// an error.
 	std::vector<RequestPtr> Recv();
@@ -268,9 +271,11 @@ public:
 	// Send a websocket frame. This can be called from multiple threads.
 	// Returns false if the WebSocket channel has been closed
 	bool SendWebSocket(int64_t connectionID, RequestType type, const void* buf, size_t len);
+	bool SendWebSocket(int64_t connectionID, RequestType type, const std::string& buf);
 
 	// Close a websocket connection. This can be called from multiple threads.
 	void CloseWebSocket(int64_t connectionID, WebSocketCloseReason reason, const void* message = nullptr, size_t messageLen = 0);
+	void CloseWebSocket(int64_t connectionID, WebSocketCloseReason reason, const std::string& message);
 
 	// This is exposed so that it's testable
 	static void _UnmaskBuffer(uint8_t* buf, size_t bufLen, uint8_t* mask, uint32_t& maskPos);
@@ -300,15 +305,15 @@ private:
 
 		// WebSocket state
 		bool               HaveWebSockHead    = false;
-		bool               IsWebSocketFin     = false; // FIN bit (ie final packet in a sequence. First frame can be final frame)
-		uint64_t           WebSockPayloadRecv = 0;     // Number of payload bytes received in this websocket frame
-		uint64_t           WebSockPayloadLen  = 0;     // Size of this frame's payload
-		uint8_t            WebSockMask[4];
-		uint32_t           WebSockMaskPos = 0;
-		uint8_t            WebSockHeadBuf[14];    // In case we receive less than a full header, we need to save those few bytes for next time
-		size_t             WebSockHeadBufLen = 0; // Number of bytes inside WebSockHeadBuf.
-		WebSocketFrameType WebSockType       = WebSocketFrameType::Unknown;
-		std::string        WebSockControlBody; // Buffer to store body of control frame (specifically Ping or Close). Regular frame's body is stored in Req->Body.
+		bool               IsWebSocketFin     = false;                      // FIN bit (ie final packet in a sequence. First frame can be final frame)
+		uint64_t           WebSockPayloadRecv = 0;                          // Number of payload bytes received in this websocket frame
+		uint64_t           WebSockPayloadLen  = 0;                          // Size of this frame's payload
+		uint8_t            WebSockMask[4];                                  // WebSocket "mask", which is XOR'ed with the incoming data
+		uint32_t           WebSockMaskPos = 0;                              // Value between 0..3, recording our offset inside WebSockMask
+		uint8_t            WebSockHeadBuf[14];                              // In case we receive less than a full header, we need to save those few bytes for next time
+		size_t             WebSockHeadBufLen = 0;                           // Number of bytes inside WebSockHeadBuf.
+		WebSocketFrameType WebSockType       = WebSocketFrameType::Unknown; // Type of WebSocket frame
+		std::string        WebSockControlBody;                              // Buffer to store body of control frame (specifically Ping or Close). Regular frame's body is stored in Req->Body.
 
 		Connection();
 		bool IsWebSocket() const { return State == ConnectionState::WebSocket; }

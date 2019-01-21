@@ -183,12 +183,9 @@ int main(int argc, char** argv) {
 		} else if (r.Type == phttp::RequestType::WebSocketText) {
 			// This demonstrates sending a reply to a websocket frame.
 			// WebSockets are not typically used in a request/response manner,
-			// but if you want to send a websocket frame inside a
-			// a handler like this, then you must use this mechanism.
-			// You cannot call SendWebSocket from a handler function,
-			// because it violates the simple threading model of phttp::Server.
-			printf("websocket in: %s\n", r.Body.c_str());
-			w.Body = "instant response!";
+			// but for the purposes of demonstration, we do that here.
+			printf("websocket in: %s\n", r.Frame().c_str());
+			server.SendWebSocket(r.ConnectionID, phttp::RequestType::WebSocketText, "hi from websocket!");
 		}
 	};
 

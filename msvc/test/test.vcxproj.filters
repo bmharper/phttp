@@ -11,38 +11,38 @@
     </Filter>
     <Filter Include="Resource Files">
       <UniqueIdentifier>{67DA6AB6-F800-4c08-8B7A-83BB121AAD01}</UniqueIdentifier>
-      <Extensions>rc;ico;cur;bmp;dlg;rc2;rct;bin;rgs;gif;jpg;jpeg;jpe;resx;tiff;tif;png;wav;mfcribbon-ms</Extensions>
+      <Extensions>rc;ico;cur;bmp;dlg;rc2;rct;bin;rgs;gif;jpg;jpeg;jpe;resx;tiff;tif;png;wav</Extensions>
     </Filter>
   </ItemGroup>
   <ItemGroup>
-    <ClInclude Include="..\tests\sema.h">
+    <ClCompile Include="..\..\phttp.cpp">
       <Filter>Source Files</Filter>
-    </ClInclude>
-    <ClInclude Include="..\phttp.h">
+    </ClCompile>
+    <ClCompile Include="..\..\sha1.c">
       <Filter>Source Files</Filter>
-    </ClInclude>
-    <ClInclude Include="..\sha1.h">
+    </ClCompile>
+    <ClCompile Include="..\..\tests\server.cpp">
       <Filter>Source Files</Filter>
-    </ClInclude>
-    <ClInclude Include="..\http11\http11_common.h">
+    </ClCompile>
+    <ClCompile Include="..\..\http11\http11_parser.c">
       <Filter>Source Files</Filter>
-    </ClInclude>
-    <ClInclude Include="..\http11\http11_parser.h">
-      <Filter>Source Files</Filter>
-    </ClInclude>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
-    <ClCompile Include="..\tests\server.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="..\phttp.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="..\sha1.c">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="..\http11\http11_parser.c">
-      <Filter>Source Files</Filter>
-    </ClCompile>
+    <ClInclude Include="..\..\sha1.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\tests\sema.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\phttp.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\http11\http11_parser.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\http11\http11_common.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
   </ItemGroup>
 </Project>

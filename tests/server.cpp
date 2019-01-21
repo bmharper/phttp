@@ -61,12 +61,12 @@ void RunSingleThread(phttp::Server& s) {
 			w.SetStatus(200);
 			s.Stop();
 		} else if (r.Path == "/echo") {
-			w.SetStatusAndBody(200, r.Body);
+			w.SetStatusAndBody(200, *r.HttpBody());
 		} else if (r.Path == "/echo-method") {
 			if (r.Method == "HEAD")
 				w.SetStatusAndBody(200, "");
 			else
-				w.SetStatusAndBody(200, r.Method + "-" + r.Body);
+				w.SetStatusAndBody(200, r.Method + "-" + *r.HttpBody());
 		} else {
 			w.SetStatus(404);
 		}
@@ -119,7 +119,7 @@ void ProcessWSFrame(ServerState* ss, phttp::RequestPtr r) {
 	// Ensure that the value coming in is greater than the previous value that we received.
 	// Also verify that the websocket ID is known to us
 	lock_guard<mutex> lock(ss->WSLock);
-	int               val = atoi(r->Body.c_str());
+	int               val = atoi(r->Frame().c_str());
 	if (ss->WSLastRecv.find(r->ConnectionID) == ss->WSLastRecv.end()) {
 		printf("Received value %d on unknown websocket id %d (occurs sometimes at start)", val, (int) r->ConnectionID);
 		return;
@@ -197,7 +197,7 @@ void ProcessingThread(ServerState* ss, phttp::Server* s) {
 		} else if (r->IsWebSocketFrame()) {
 			ProcessWSFrame(ss, r);
 		} else if (r->Path == "/echo-method") {
-			w.SetStatusAndBody(200, r->Method + "-MT-" + r->Body);
+			w.SetStatusAndBody(200, r->Method + "-MT-" + *r->HttpBody());
 			s->SendHttp(w);
 		} else if (r->Path == "/kill") {
 			//printf("Received kill\n");
@@ -239,10 +239,10 @@ int RunMultiThread(phttp::Server& s) {
 	ss.Exit = true;
 
 	// wake up the threads, and get them to exit
-	for (int i = 0; i < threads.size(); i++)
+	for (size_t i = 0; i < threads.size(); i++)
 		ss.Q.Push(nullptr);
 
-	for (int i = 0; i < threads.size(); i++) {
+	for (size_t i = 0; i < threads.size(); i++) {
 		threads[i].join();
 	}
 
@@ -269,7 +269,7 @@ int main(int argc, char** argv) {
 	if (runMode == "--ListenAndRun") {
 		RunSingleThread(s);
 		return 0;
-	} else if (runMode == "--Concurrent") {
+	} else if (runMode == "--concurrent") {
 		return RunMultiThread(s);
 	} else {
 		printf("Unknown run mode %s\n", runMode.c_str());
