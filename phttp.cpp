@@ -12,6 +12,7 @@
 #else
 #include <arpa/inet.h>
 #include <netinet/tcp.h>
+#include <sys/uio.h>
 #include <poll.h>
 #include <unistd.h>
 #include <fcntl.h>
@@ -36,10 +37,46 @@ typedef LONG          nfds_t;
 int poll(_Inout_ LPWSAPOLLFD fdArray, _In_ ULONG fds, _In_ INT timeout) {
 	return WSAPoll(fdArray, fds, timeout);
 }
+// WriteV returns X:
+// X >=  0 : Wrote X bytes. If X is less than total bytes in buffers, then it was a partial write, and the OS buffer is full.
+// X == -1 : Error. You should probably close the socket.
+static size_t WriteV(Server::socket_t sock, const std::vector<Server::OutBuf>& buffers) {
+	vector<WSABUF> bufs;
+	for (auto b : buffers) {
+		WSABUF w;
+		w.buf = (char*) b.Buf;
+		w.len = b.Len;
+		bufs.push_back(w);
+	}
+	DWORD bytesSent = 0;
+	int   res       = WSASend(sock, &bufs[0], (int) bufs.size(), &bytesSent, 0, nullptr, nullptr);
+	if (res == 0)
+		return bytesSent;
+	if (WSAGetLastError() == WSAEWOULDBLOCK)
+		return bytesSent;
+	return -1;
+}
 #else
 static const uint32_t Infinite        = 0xFFFFFFFF;
 static const int      ErrSOCKET_ERROR = -1;
 inline int            closesocket(int fd) { return close(fd); }
+// See Windows definition for return values
+static size_t WriteV(Server::socket_t sock, const std::vector<Server::OutBuf>& buffers) {
+	typedef struct iovec iovec_t;
+	vector<iovec_t>      bufs;
+	for (auto b : buffers) {
+		iovec_t v;
+		v.iov_base = (void*) b.Buf;
+		v.iov_len  = b.Len;
+		bufs.push_back(v);
+	}
+	ssize_t res = writev(sock, &bufs[0], (int) bufs.size());
+	if (res == -1 && errno == EWOULDBLOCK)
+		return 0;
+	if (res >= 0)
+		return res;
+	return -1;
+}
 #endif
 
 #ifdef max
@@ -131,8 +168,8 @@ static void MakeDate(char* buf) {
 	_time64(&t);
 	_gmtime64_s(&m, &t);
 #else
-    time_t t = time(nullptr);
-    gmtime_r(&t, &m);
+	time_t t = time(nullptr);
+	gmtime_r(&t, &m);
 #endif
 	sprintf(buf, "%s, %02d %s %04d %02d:%02d:%02d GMT", WeekDay[m.tm_wday], m.tm_mday, Months[m.tm_mon], m.tm_year + 1900, m.tm_hour, m.tm_min, m.tm_sec);
 }
@@ -322,6 +359,10 @@ const std::string& Request::Frame() {
 	return Body;
 }
 
+size_t Request::SendCapacity() {
+	return Server->SendCapacity(ConnectionID);
+}
+
 bool Request::IsWebSocketUpgrade() const {
 	// Chrome  (59) sends Connection: Upgrade
 	// Firefox (53) sends Connection: keep-alive, Upgrade
@@ -334,6 +375,19 @@ Response::Response() {
 }
 
 Response::Response(RequestPtr request) : Request(request) {
+}
+
+Response Response::MakeMultiHead(RequestPtr request) {
+	Response r(request);
+	r.Type = Types::MultiHead;
+	return r;
+}
+
+Response Response::MakeMultiBody(RequestPtr request, const void* buf, size_t len) {
+	Response r(request);
+	r.Type = Types::MultiBody;
+	r.Body.assign((const char*) buf, len);
+	return r;
 }
 
 size_t Response::FindHeader(const std::string& header) const {
@@ -390,11 +444,11 @@ static bool SetNonBlocking(Server::socket_t fd) {
 	unsigned long mode = blocking ? 0 : 1;
 	return (ioctlsocket(fd, FIONBIO, &mode) == 0) ? true : false;
 #else
-    int flags = fcntl(fd, F_GETFL, 0);
-    if (flags == -1)
-        return false;
-    flags = blocking ? (flags & ~O_NONBLOCK) : (flags | O_NONBLOCK);
-    return (fcntl(fd, F_SETFL, flags) == 0) ? true : false;
+	int flags = fcntl(fd, F_GETFL, 0);
+	if (flags == -1)
+		return false;
+	flags = blocking ? (flags & ~O_NONBLOCK) : (flags | O_NONBLOCK);
+	return (fcntl(fd, F_SETFL, flags) == 0) ? true : false;
 #endif
 }
 
@@ -411,7 +465,13 @@ void FileLogger::Log(const char* msg) {
 	fwrite("\n", 1, 1, Target);
 }
 
-Server::Connection::Connection() {
+Server::Connection::Connection(Server* owner) {
+	State               = ConnectionState::HttpRecv;
+	OutQueueHasData     = false;
+	CloseWhenQueueEmpty = false;
+	IsSendBusy          = false;
+
+	Owner = owner;
 	phttp_parser_init(&Parser);
 	Parser.data           = this;
 	Parser.http_field     = cb_http_field;
@@ -422,6 +482,19 @@ Server::Connection::Connection() {
 	Parser.query_string   = cb_query_string;
 	Parser.http_version   = cb_http_version;
 	Parser.header_done    = cb_header_done;
+}
+
+bool Server::ConnectionSendSanity::Enter(Connection* c, const char* typeOfSend) {
+	bool expect = false;
+	if (!c->IsSendBusy.compare_exchange_strong(expect, true)) {
+		c->Owner->WriteLog("[%5lld] Attempt to send %s message from more than one thread simultaneously", (long long) c->ID, typeOfSend);
+		return false;
+	}
+	return true;
+}
+
+Server::ConnectionSendSanity::~ConnectionSendSanity() {
+	C->IsSendBusy = false;
 }
 
 Server::Server() {
@@ -518,11 +591,11 @@ void Server::Stop() {
 		closesocket(ListenSock);
 		ListenSock = InvalidSocket;
 #else
-        // Write a dummy byte into ClosePipe, to wake poll() up, so we can exit cleanly.
-        // The linux docs say that it's illegal to close() a socket from another thread,
-        // while you're busy waiting on it with a select() or poll(), so we use a pipe
-        // here instead.
-        write(ClosePipe[1], "x", 1);
+		// Write a dummy byte into ClosePipe, to wake poll() up, so we can exit cleanly.
+		// The linux docs say that it's illegal to close() a socket from another thread,
+		// while you're busy waiting on it with a select() or poll(), so we use a pipe
+		// here instead.
+		write(ClosePipe[1], "x", 1);
 #endif
 	}
 }
@@ -539,12 +612,16 @@ std::vector<RequestPtr> Server::Recv() {
 			// The code down below which does the Accept() assumes ListenSock is fds[0]
 			fds.push_back({ListenSock, POLLIN, 0});
 #ifndef _WIN32
-			// On WIN32, we just close ListenSock, which is fine. Linux says that's illegal to do from a different thread, so we use a special pipe to wake us up on linux.
+			// On WIN32, we just close ListenSock, which is fine. Linux says that's illegal to do that from a different thread, so we use a special pipe to wake us up on linux.
 			fds.push_back({ClosePipe[0], POLLIN, 0});
 #endif
 			reqStart = fds.size();
-			for (auto c : Connections)
-				fds.push_back({c->Sock, POLLIN, 0});
+			for (auto c : Connections) {
+				short events = POLLIN;
+				if (c->OutQueueHasData)
+					events |= POLLOUT;
+				fds.push_back({c->Sock, events, 0});
+			}
 		}
 
 		//printf("poll in (%d)\n", (int) Connections.size());
@@ -562,30 +639,38 @@ std::vector<RequestPtr> Server::Recv() {
 			AcceptOrReject();
 
 		for (size_t i = reqStart; i < fds.size(); i++) {
-			if (fds[i].revents == POLLNVAL) {
+			if (!!(fds[i].revents & POLLNVAL)) {
 				WriteLog("Invalid poll() request on socket [%5d]", (int) fds[i].fd);
 				continue;
 			}
-			if (fds[i].revents) {
+
+			bool canRead  = !!(fds[i].revents & POLLIN);
+			bool canWrite = !!(fds[i].revents & POLLOUT);
+			if (canRead || canWrite) {
 				ConnectionPtr c;
 				{
 					lock_guard<mutex> lock(ConnectionsLock);
 					auto              con = Sock2Connection.find(fds[i].fd);
 					if (con == Sock2Connection.end()) {
 						WriteLog("Received data on unknown socket [%5d]", (int) fds[i].fd);
-						//char buf[1000];
-						//int  nread = recv(fds[i].fd, buf, sizeof(buf), 0);
-						//buf[nread] = 0;
-						//printf("buf:\n%s\n", buf);
 						continue;
 					}
 					c = con->second;
 				}
-				RequestPtr r;
-				if (!ReadFromConnection(c.get(), r))
-					CloseConnection(c);
-				if (r != nullptr)
-					requests.push_back(r);
+
+				if (canWrite) {
+					if (!SendBytes(c.get(), {}))
+						CloseConnection(c);
+					if (!c->OutQueueHasData && c->CloseWhenQueueEmpty)
+						CloseConnection(c);
+				}
+				if (canRead && (c->State == ConnectionState::HttpRecv || c->State == ConnectionState::WebSocket)) {
+					RequestPtr r;
+					if (!ReadFromConnection(c.get(), r))
+						CloseConnection(c);
+					if (r != nullptr)
+						requests.push_back(r);
+				}
 			}
 		}
 		if (requests.size() != 0)
@@ -620,7 +705,15 @@ void Server::AcceptOrReject() {
 	int optval = 1;
 	setsockopt(newSock, IPPROTO_TCP, TCP_NODELAY, (const char*) &optval, sizeof(optval));
 
-	ConnectionPtr con = make_shared<Connection>();
+	// We always do non-blocking IO on our sockets. If we didn't do this, then we wouldn't be
+	// able to implement things like streaming out large files to multiple connections,
+	// from a single thread.
+	if (!SetNonBlocking(newSock)) {
+		WriteLog("Failed to set new socket to non-blocking mode: %d", LastError());
+		return;
+	}
+
+	ConnectionPtr con = make_shared<Connection>(this);
 	con->Sock         = newSock;
 	con->ID           = NextReqID++;
 	con->Request      = make_shared<Request>(this, con->ID, RequestType::Http);
@@ -980,11 +1073,12 @@ void Server::SendHttp(Response& w) {
 }
 
 bool Server::SendHttpInternal(Response& w) {
-	// This wouldn't be a constant if we supported chunked responses, or transmitting a response bit by bit.
-	const bool isFinalResponse = true;
-
 	if (w.Request->Method == "HEAD" && w.Body.size() != 0) {
-		WriteLog("HEAD response may not contain a body");
+		WriteLog("[%5lld] HEAD response may not contain a body", (long long) w.Request->ConnectionID);
+		return false;
+	}
+	if (w.Type == Response::Types::MultiHead && w.Body.size() != 0) {
+		WriteLog("[%5lld] MultiHead response may not contain any body data", (long long) w.Request->ConnectionID);
 		return false;
 	}
 
@@ -993,6 +1087,7 @@ bool Server::SendHttpInternal(Response& w) {
 			w.Status = Status500_Internal_Server_Error;
 			w.SetHeader("Content-Type", "text/plain");
 			w.Body = "Handler did not produce a response";
+			WriteLog("[%5lld] Empty Response", (long long) w.Request->ConnectionID);
 		} else {
 			w.Status = Status200_OK;
 		}
@@ -1009,8 +1104,12 @@ bool Server::SendHttpInternal(Response& w) {
 		c = pos->second;
 	}
 
+	ConnectionSendSanity sanity;
+	if (!sanity.Enter(c.get(), "HTTP"))
+		return false;
+
 	if (c->State != ConnectionState::HttpSend) {
-		WriteLog("Attempt to send HTTP response when state is %d", (int) c->State);
+		WriteLog("[%5lld] Attempt to send HTTP response when state is %d", (int) c->State.load(), (long long) w.Request->ConnectionID);
 		return false;
 	}
 
@@ -1020,33 +1119,20 @@ bool Server::SendHttpInternal(Response& w) {
 		return true;
 	}
 
-	string acceptEncoding = w.Request->Header("Accept-Encoding");
-	char*  bodyBuf        = const_cast<char*>(w.Body.data());
-	size_t bodyLen        = w.Body.size();
-	bool   mustFreeBody   = false;
+	bool isSimple     = w.Type == Response::Types::Simple;
+	bool isFinalMulti = w.Type == Response::Types::MultiBody && w.Body.size() == 0;
 
-	if (Compressor && w.FindHeader("Content-Length") == -1 && w.FindHeader("Content-Encoding") == -1) {
-		void*  cbuf = nullptr;
-		size_t clen = 0;
-		string responseEncoding;
-		if (Compressor->Compress(acceptEncoding, w.Body.data(), w.Body.size(), cbuf, clen, responseEncoding)) {
-			bodyBuf      = (char*) cbuf;
-			bodyLen      = clen;
-			mustFreeBody = true;
-			w.SetHeader("Content-Encoding", responseEncoding);
-		}
-	}
+	// True if this is the final chunk of bits that we are sending to this TCP socket.
+	// If true, then we will either recycle this socket for another HTTP request, or
+	// close it.
+	bool sendHead        = w.Type == Response::Types::Simple || w.Type == Response::Types::MultiHead;
+	bool isFinalResponse = w.Type == Response::Types::Simple || isFinalMulti;
 
-	char linebuf[1024];
-	if (w.FindHeader("Content-Length") == -1) {
-		sprintf(linebuf, "%llu", (unsigned long long) bodyLen);
-		w.SetHeader("Content-Length", linebuf);
-	}
-
-	if (w.FindHeader("Date") == -1) {
-		MakeDate(linebuf);
-		w.SetHeader("Date", linebuf);
-	}
+	string acceptEncoding;
+	char*  bodyBuf      = const_cast<char*>(w.Body.data());
+	size_t bodyLen      = w.Body.size();
+	bool   mustFreeBody = false;
+	string head;
 
 	// For HTTP/1.0, keep-alive is not the default
 	bool keepAlive = true;
@@ -1056,30 +1142,47 @@ bool Server::SendHttpInternal(Response& w) {
 			keepAlive = false;
 	}
 
-	if (w.FindHeader("Connection") == -1 && c->Request->Version == "HTTP/1.0" && keepAlive) {
-		w.SetHeader("Connection", "Keep-Alive");
+	if (Compressor && isSimple && w.FindHeader("Content-Length") == -1 && w.FindHeader("Content-Encoding") == -1) {
+		void*  cbuf = nullptr;
+		size_t clen = 0;
+		string responseEncoding;
+		acceptEncoding = w.Request->Header("Accept-Encoding");
+		if (Compressor->Compress(acceptEncoding, w.Body.data(), w.Body.size(), cbuf, clen, responseEncoding)) {
+			bodyBuf      = (char*) cbuf;
+			bodyLen      = clen;
+			mustFreeBody = true;
+			w.SetHeader("Content-Encoding", responseEncoding);
+		}
 	}
 
-	string wbuf;
+	if (sendHead) {
+		char linebuf[1024];
+		if (w.FindHeader("Content-Length") == -1) {
+			sprintf(linebuf, "%llu", (unsigned long long) bodyLen);
+			w.SetHeader("Content-Length", linebuf);
+		}
 
-	// top line
-	sprintf(linebuf, "%s %03u %s\r\n", w.Request->Version.c_str(), (unsigned) w.Status, StatusMsg(w.Status));
-	wbuf.append(linebuf);
+		if (w.FindHeader("Date") == -1) {
+			MakeDate(linebuf);
+			w.SetHeader("Date", linebuf);
+		}
 
-	// other headers
-	for (const auto& h : w.Headers) {
-		wbuf.append(h.first);
-		wbuf.append(": ");
-		wbuf.append(h.second);
-		wbuf.append("\r\n");
-	}
-	wbuf.append("\r\n");
+		if (w.FindHeader("Connection") == -1 && c->Request->Version == "HTTP/1.0" && keepAlive)
+			w.SetHeader("Connection", "Keep-Alive");
 
-	// If body is above a thumbsuck threshold, then send it separately.
-	// We do this to avoid the expensive memcpy of a large response body.
-	bool sendBodySeparate = bodyLen > 4000;
-	if (!sendBodySeparate)
-		wbuf.append(bodyBuf, bodyLen);
+		// top line
+		sprintf(linebuf, "%s %03u %s\r\n", w.Request->Version.c_str(), (unsigned) w.Status, StatusMsg(w.Status));
+		head.append(linebuf);
+
+		// other headers
+		for (const auto& h : w.Headers) {
+			head.append(h.first);
+			head.append(": ");
+			head.append(h.second);
+			head.append("\r\n");
+		}
+		head.append("\r\n");
+	} // if (sendHead)
 
 	if (isFinalResponse && keepAlive) {
 		// Reset the parser for another request. It is important that we reset to allow new data BEFORE
@@ -1090,20 +1193,29 @@ bool Server::SendHttpInternal(Response& w) {
 		ResetForAnotherHttpRequest(c);
 	}
 
-	bool okSend1 = SendBytes(c.get(), wbuf.c_str(), wbuf.size());
-	bool okSend2 = true;
-	if (okSend1 && sendBodySeparate)
-		okSend2 = SendBytes(c.get(), bodyBuf, bodyLen);
+	vector<OutBuf> buffers;
+	if (sendHead)
+		buffers.push_back(OutBuf(head.data(), head.size()));
+
+	if (bodyLen != 0)
+		buffers.push_back(OutBuf(bodyBuf, bodyLen));
+
+	bool sendOK = SendBytes(c.get(), buffers);
 
 	if (mustFreeBody)
 		Compressor->Free(acceptEncoding, bodyBuf);
 
-	if (!(okSend1 && okSend2))
+	if (!sendOK)
 		return false;
 
 	if (isFinalResponse && !keepAlive) {
-		c->State = ConnectionState::Shutdown;
-		shutdown(c->Sock, 2); // 2 = SHUT_RDWR(unix) = SD_BOTH(win32)
+		if (!c->OutQueueHasData) {
+			c->State = ConnectionState::Shutdown;
+			shutdown(c->Sock, 2); // 2 = SHUT_RDWR(unix) = SD_BOTH(win32)
+		} else {
+			// the poll loop will shutdown this socket once the queued data has been sent
+			c->CloseWhenQueueEmpty = true;
+		}
 	}
 
 	return true;
@@ -1115,6 +1227,10 @@ void Server::ResetForAnotherHttpRequest(ConnectionPtr c) {
 	c->ID               = NextReqID++;
 	c->Request          = make_shared<Request>(this, c->ID, RequestType::Http);
 	c->IsHttpHeaderDone = false;
+	c->HttpHeadBuf.clear();
+	c->ChunkHead.clear();
+	c->ChunkReceived = 0;
+	// We do not clear c->OutQueue here, because there may still be data from the previous request that hasn't been written yet
 	phttp_parser_init(&c->Parser);
 	if (LogAllEvents)
 		WriteLog("[%5lld %5d] recycling socket (ID %lld) for another request", (long long) c->ID, (int) c->Sock, (long long) oldID);
@@ -1128,6 +1244,10 @@ void Server::ResetForAnotherHttpRequest(ConnectionPtr c) {
 bool Server::SendWebSocket(int64_t connectionID, RequestType type, const void* buf, size_t len) {
 	auto c = ConnectionFromID(connectionID);
 	if (c == nullptr)
+		return false;
+
+	ConnectionSendSanity sanity;
+	if (!sanity.Enter(c.get(), "WebSocket"))
 		return false;
 
 	WebSocketFrameType ft = WebSocketFrameType::Unknown;
@@ -1201,6 +1321,19 @@ void Server::CloseWebSocket(int64_t connectionID, WebSocketCloseReason reason, c
 	CloseWebSocket(connectionID, reason, haveMessage ? message.c_str() : nullptr, haveMessage ? message.size() : 0);
 }
 
+size_t Server::SendCapacity(int64_t connectionID) {
+	auto c = ConnectionFromID(connectionID);
+	if (!c)
+		return -1;
+	if (c->OutQueueHasData)
+		return 0;
+	if (c->State != ConnectionState::HttpSend)
+		return -1;
+
+	// this value is total thumbsuck. I don't think it's simple to compute an optimal value for this.
+	return 65536;
+}
+
 void Server::_UnmaskBuffer(uint8_t* buf, size_t bufLen, uint8_t* mask, uint32_t& maskPos) {
 	uint32_t mp = maskPos & 3;
 
@@ -1261,9 +1394,63 @@ bool Server::UpgradeToWebSocket(Response& w, Connection* c) {
 	return true;
 }
 
-bool Server::SendBytes(Connection* c, const char* buf, size_t len) {
-	std::lock_guard<std::mutex> lock(c->SendLock);
-	size_t                      sent = 0;
+bool Server::SendBytes(Connection* c, const void* buf, size_t len) {
+	vector<OutBuf> buffers;
+	if (len != 0)
+		buffers.emplace_back(buf, len);
+	return SendBytes(c, buffers);
+}
+
+// Return:
+// true   Continue sending (but check if OutQueue has data in it, and if so, then wait until it's empty before sending more)
+// false  Close this socket
+bool Server::SendBytes(Connection* c, std::vector<OutBuf> buffers) {
+	lock_guard<mutex> lock(c->SendLock);
+
+	size_t orgOutQueueSize = c->OutQueue.size();
+	if (c->OutQueue.size() != 0) {
+		// insert queued data into head of buffer list
+		OutBuf q;
+		q.Buf = c->OutQueue.data();
+		q.Len = c->OutQueue.size();
+		buffers.insert(buffers.begin(), q);
+	}
+
+	size_t total = 0;
+	for (const auto& b : buffers)
+		total += b.Len;
+	if (total == 0)
+		return true;
+
+	size_t written = WriteV(c->Sock, buffers);
+	if (written == total) {
+		c->OutQueue.clear();
+		c->OutQueueHasData = false;
+		return true;
+	}
+	if (written == -1) {
+		WriteLog("[%5lld %5d] send error %d", (long long) c->ID, (int) c->Sock, LastError());
+		return false;
+	}
+
+	// remaining case is a partial write, where written < total
+
+	if (written < c->OutQueue.size()) {
+		// we didn't even get through OutQueue
+		c->OutQueue.erase(0, written);
+	}
+
+	// add all of the buffers to OutQueue
+	size_t i = orgOutQueueSize == 0 ? 0 : 1;
+	for (; i < buffers.size(); i++)
+		c->OutQueue.append((const char*) buffers[i].Buf, buffers[i].Len);
+
+	c->OutQueueHasData = c->OutQueue.size() != 0;
+
+	return true;
+
+	/*
+	size_t sent = 0;
 	while (sent != len) {
 		if (StopSignal)
 			return false;
@@ -1279,6 +1466,7 @@ bool Server::SendBytes(Connection* c, const char* buf, size_t len) {
 		sent += nsend;
 	}
 	return true;
+	*/
 }
 
 bool Server::SendWebSocketPong(Connection* c) {
@@ -1399,7 +1587,7 @@ void Server::CloseConnectionByID(int64_t id) {
 }
 
 void Server::CloseConnection(ConnectionPtr c) {
-	bool isWebSocket = c->IsWebSocket();
+	//bool isWebSocket = c->IsWebSocket();
 	{
 		lock_guard<mutex> lock(ConnectionsLock);
 		if (ID2Connection.find(c->ID) == ID2Connection.end()) {
@@ -1509,7 +1697,7 @@ int Server::LastError() {
 #ifdef _WIN32
 	return (int) WSAGetLastError();
 #else
-    return errno;
+	return errno;
 #endif
 }
 } // namespace phttp

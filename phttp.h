@@ -184,6 +184,7 @@ public:
 	bool               IsHttpBodyFinished();                                                // Returns true if the final chunk of HTTP body data has been received
 	const std::string* HttpBody();                                                          // Returns a pointer to the complete request HTTP body, or NULL if the request is still being sent
 	const std::string& Frame();                                                             // Returns the contents of the WebSocket frame, or an empty string if this is not a WebSocket frame
+	size_t             SendCapacity();                                                      // See Server::SendCapacity()
 	bool               IsWebSocketUpgrade() const;
 	bool               IsHttp() const { return Type == RequestType::Http; }
 	bool               IsHttpFinal() { return Type == RequestType::Http && IsHttpBodyFinished(); }
@@ -204,6 +205,12 @@ typedef std::shared_ptr<Request> RequestPtr;
 */
 class PHTTP_API Response {
 public:
+	enum class Types {
+		Simple,    // Entire response is contained within this Response object. This is the default.
+		MultiHead, // Response is split across multiple Response objects. This is the first part, and it contains all the headers, and none of the body.
+		MultiBody, // Response is split across multiple Response objects. This is the next part of the body, or the final part, if the Body is empty.
+	};
+	Types                                            Type = Types::Simple;
 	RequestPtr                                       Request;    // The request that originated this response
 	int                                              Status = 0; // Status code, such as 200 or 404
 	std::vector<std::pair<std::string, std::string>> Headers;    // Response headers
@@ -211,6 +218,9 @@ public:
 
 	Response();
 	Response(RequestPtr request);
+	static Response MakeMultiHead(RequestPtr request);
+	static Response MakeMultiBody(RequestPtr request, const void* buf, size_t len);
+
 	size_t FindHeader(const std::string& header) const; // Returns the index of the first named header, or -1 if not found. Search is case-insensitive
 	void   SetHeader(const std::string& header, const std::string& val);
 	void   SetStatus(int status);
@@ -238,9 +248,10 @@ typedef std::shared_ptr<Logger> LoggerPtr;
 
 // Expose a compressor to transparently compress all responses (with gzip, deflate, etc).
 // All methods of ICompressor must be callable from multiple threads.
-// The following two conditions disable transparent compression:
+// The following conditions disable transparent compression:
 // * Content-Encoding is set in the Response
 // * Content-Length is set in the Response
+// * The Response is multiple parts (ie Type is not Simple)
 class PHTTP_API Compressor {
 public:
 	virtual ~Compressor() {}
@@ -272,6 +283,13 @@ public:
 	typedef int           socket_t;
 	static const socket_t InvalidSocket = (socket_t)(~0);
 #endif
+
+	struct OutBuf {
+		const void* Buf = nullptr;
+		size_t      Len = 0;
+		OutBuf() {}
+		OutBuf(const void* buf, size_t len) : Buf(buf), Len(len) {}
+	};
 
 	int                MaxConnections   = 4096; // You can raise this to 64k, but our use of poll() makes high socket numbers expensive
 	LoggerPtr          Log              = nullptr;
@@ -313,6 +331,14 @@ public:
 	void CloseWebSocket(int64_t connectionID, WebSocketCloseReason reason, const void* message = nullptr, size_t messageLen = 0);
 	void CloseWebSocket(int64_t connectionID, WebSocketCloseReason reason, const std::string& message);
 
+	// Ask the server how many bytes should be sent with the next body chunk.
+	// This is only for large responses that span multiple Response objects.
+	// Returns 0 if the channel's buffer is full.
+	// Returns -1 if the channel has been closed, or for any other reason you should abort the send.
+	// Returns a positive integer if the channel has capacity. You should send
+	// no more bytes than the returned value.
+	size_t SendCapacity(int64_t connectionID);
+
 	// This is exposed so that it's testable
 	static void _UnmaskBuffer(uint8_t* buf, size_t bufLen, uint8_t* mask, uint32_t& maskPos);
 
@@ -328,16 +354,21 @@ private:
 	// This represents a socket, which is initially opened for an HTTP request,
 	// but may be recycled for future HTTP requests, or upgraded to a websocket.
 	struct Connection {
-		ConnectionState State = ConnectionState::HttpRecv;
-		socket_t        Sock  = InvalidSocket;
-		int64_t         ID    = 0;                // ID of the channel (see Server class docs)
-		phttp_parser    Parser;                   // HTTP request parser state
-		bool            IsHttpHeaderDone = false; // Toggled once Parser tells us that it's finished parsing the header
-		RequestPtr      Request;                  // Associated request
-		std::string     HttpHeadBuf;              // Buffer of HTTP header. The parser design needs to have the entire header in memory until it's finished.
-		std::mutex      SendLock;                 // Used by the server to ensure that only a single thread is writing to the socket at a time
-		std::string     ChunkHead;                // Stores the most recently received chunk head
-		size_t          ChunkReceived = 0;        // Number of bytes that we have received for the current chunk
+		Server*                      Owner = nullptr;
+		std::atomic<ConnectionState> State;
+		socket_t                     Sock = InvalidSocket;
+		int64_t                      ID   = 0;                 // ID of the channel (see Server class docs)
+		phttp_parser                 Parser;                   // HTTP request parser state
+		bool                         IsHttpHeaderDone = false; // Toggled once Parser tells us that it's finished parsing the header
+		RequestPtr                   Request;                  // Associated request
+		std::string                  HttpHeadBuf;              // Buffer of HTTP header. The parser design needs to have the entire header in memory until it's finished.
+		std::mutex                   SendLock;                 // Used by the server to ensure that only a single thread is writing to the socket at a time
+		std::string                  ChunkHead;                // Stores the most recently received chunk head
+		size_t                       ChunkReceived = 0;        // Number of bytes that we have received for the current chunk
+		std::string                  OutQueue;                 // When a send() partially succeeds, then the remaining unsent bytes are placed in OutQueue. Must hold SendLock.
+		std::atomic<bool>            OutQueueHasData;          // This is synonymous with OutQueue.size() != 0. This was created so that we could avoid locking every connection in our poll() loop.
+		std::atomic<bool>            CloseWhenQueueEmpty;      // Special state for an HTTP socket that has Keep-Alive:false, and OutQueue is not empty.
+		std::atomic<bool>            IsSendBusy;               // This is here to prevent user code from making the mistake of sending to a socket from multiple threads simultaneously
 
 		// WebSocket state
 		bool               HaveWebSockHead    = false;
@@ -351,9 +382,15 @@ private:
 		WebSocketFrameType WebSockType       = WebSocketFrameType::Unknown; // Type of WebSocket frame
 		std::string        WebSockControlBody;                              // Buffer to store body of control frame (specifically Ping or Close). Regular frame's body is stored in Req->Body.
 
-		Connection();
+		Connection(Server* owner);
 		bool IsWebSocket() const { return State == ConnectionState::WebSocket; }
 		bool IsWebSockControlFrame() const { return !!((uint8_t) WebSockType & 8); }
+	};
+	// This prevents user code from making the mistake of sending to a socket from multiple threads simultaneously
+	struct ConnectionSendSanity {
+		Connection* C = nullptr;
+		bool        Enter(Connection* c, const char* typeOfSend);
+		~ConnectionSendSanity();
 	};
 
 	typedef std::shared_ptr<Connection> ConnectionPtr;
@@ -361,7 +398,7 @@ private:
 	socket_t ListenSock = InvalidSocket;
 	int      ClosePipe[2]; // Used on linux to wake poll()
 
-	std::mutex                                  ConnectionsLock; // Guards Connections, Sock2Connection, NextReqID
+	std::mutex                                  ConnectionsLock; // Guards Connections, Sock2Connection, ID2Connection
 	std::vector<ConnectionPtr>                  Connections;
 	std::unordered_map<socket_t, ConnectionPtr> Sock2Connection; // Map from socket to connection. This changes only when we get a new TCP connection.
 	std::unordered_map<int64_t, ConnectionPtr>  ID2Connection;   // Map from ID to connection. This changes frequently, as connections are recycled for new requests.
@@ -390,7 +427,8 @@ private:
 	bool UpgradeToWebSocket(Response& w, Connection* c);
 	void ReadWebSocketBody(Connection* c);
 	bool SendHttpInternal(Response& w);
-	bool SendBytes(Connection* c, const char* buf, size_t len);
+	bool SendBytes(Connection* c, const void* buf, size_t len);
+	bool SendBytes(Connection* c, std::vector<OutBuf> buffers);
 	bool SendWebSocketPong(Connection* c);
 	bool ParsePath(Request* r);
 	bool ParseQuery(Request* r);

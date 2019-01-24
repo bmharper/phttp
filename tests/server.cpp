@@ -4,6 +4,7 @@
 #include <string>
 #include <thread>
 #include <atomic>
+#include <algorithm>
 #include "sema.h"
 
 #ifdef _WIN32
@@ -13,6 +14,7 @@
 #endif
 
 using namespace std;
+typedef uint8_t byte;
 
 static const char*    BindAddress  = "localhost";
 static int            Port         = 8080;
@@ -79,36 +81,50 @@ void RunSingleThread(phttp::Server& s) {
 	});
 }
 
+template <typename T>
 class Queue {
 public:
-	void Push(phttp::RequestPtr r) {
+	bool Blocking = true; // If Blocking is false, then Pop() returns T() if the queue is empty
+
+	void Push(T r) {
 		{
 			lock_guard<mutex> lock(Lock);
 			Items.push_back(r);
 		}
-		Sem.signal();
+		if (Blocking)
+			Sem.signal();
 	}
 
-	phttp::RequestPtr Pop() {
-		Sem.wait();
+	T Pop() {
+		if (Blocking)
+			Sem.wait();
 		lock_guard<mutex> lock(Lock);
-		auto              item = Items.front();
+		if (Items.size() == 0)
+			return T();
+		auto item = Items.front();
 		Items.erase(Items.begin());
 		return item;
 	}
 
 private:
-	mutex                     Lock;
-	vector<phttp::RequestPtr> Items;
-	Semaphore                 Sem;
+	mutex     Lock;
+	vector<T> Items;
+	Semaphore Sem;
 };
 
 struct ServerState {
-	atomic<bool> Exit;
-	Queue        Q;
+	atomic<bool>             Exit;
+	Queue<phttp::RequestPtr> HttpQ;
 
 	mutex                       WSLock;     // Guards access to all websocket state
 	unordered_map<int64_t, int> WSLastRecv; // Key = websocket ID. Value = latest number received from client
+
+	Queue<phttp::RequestPtr> StreamQ;
+
+	ServerState() {
+		HttpQ.Blocking   = true;
+		StreamQ.Blocking = false;
+	}
 };
 
 void Die(const char* fmt, ...) {
@@ -179,9 +195,40 @@ void WebSocketPubThread(ServerState* ss, phttp::Server* s) {
 	}
 }
 
+// This demonstrates how to stream out a large download
+void StreamThread(ServerState* ss, phttp::Server* s) {
+	struct Stream {
+		phttp::RequestPtr R;
+		int64_t           Pos  = 0;
+		int64_t           Size = 0;
+		uint32_t          Val  = 0;
+	};
+	vector<Stream> streams;
+	byte           buf[4000];
+	uint32_t       mul = 997;
+
+	while (!s->StopSignal) {
+		auto newReq = ss->StreamQ.Pop();
+		if (newReq) {
+			Stream s;
+			s.R    = newReq;
+			s.Size = newReq->QueryInt64("bytes");
+			streams.push_back(s);
+		}
+		for (size_t i = 0; i < streams.size(); i++) {
+			auto&   s     = streams[i];
+			int64_t nSend = min<int64_t>(s.Size - s.Pos, sizeof(buf));
+			for (int64_t j = 0; j < nSend; j++) {
+				s.Val  = (s.Val + 1) * mul;
+				buf[j] = byte(s.Val & 0xff);
+			}
+		}
+	}
+}
+
 void ProcessingThread(ServerState* ss, phttp::Server* s) {
 	while (!s->StopSignal) {
-		auto r = ss->Q.Pop();
+		auto r = ss->HttpQ.Pop();
 		if (!r) {
 			// null request means quit
 			break;
@@ -212,6 +259,8 @@ void ProcessingThread(ServerState* ss, phttp::Server* s) {
 				body += '0' + (i % 10);
 			w.SetStatusAndBody(200, body);
 			s->SendHttp(w);
+		} else if (r->Path == "/stream") {
+			int bytes = r->QueryInt64("bytes");
 		} else if (r->Path == "/kill") {
 			//printf("Received kill\n");
 			w.SetStatus(200);
@@ -241,19 +290,22 @@ int RunMultiThread(phttp::Server& s) {
 		threads.push_back(thread(ProcessingThread, &ss, &s));
 	}
 	threads.push_back(thread(WebSocketPubThread, &ss, &s));
+	threads.push_back(thread(StreamThread, &ss, &s));
 
 	while (true) {
 		auto queue = s.Recv();
 		if (queue.size() == 0)
 			break;
 		for (auto r : queue)
-			ss.Q.Push(r);
+			ss.HttpQ.Push(r);
 	}
 	ss.Exit = true;
 
+	ss.StreamQ.Push(nullptr);
+
 	// wake up the threads, and get them to exit
 	for (size_t i = 0; i < threads.size(); i++)
-		ss.Q.Push(nullptr);
+		ss.HttpQ.Push(nullptr);
 
 	for (size_t i = 0; i < threads.size(); i++) {
 		threads[i].join();

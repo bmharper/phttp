@@ -2,11 +2,10 @@ package main
 
 // When iterating on these tests:
 // Unix:
-//   make -s server && go run test.go
+//   make -s -j build/server.exe && go run tests/test.go
 //
 // Windows
-//   # uncomment the windows section in 'Makefile', and then:
-//   wsl make -s server.exe && go run test.go
+//   wsl WINDOWS=1 make -s -j build/server.exe && go run tests/test.go
 //
 // To benchmark with ab:
 //   make server && ./server --concurrent
@@ -78,6 +77,7 @@ func main() {
 		{"--ListenAndRun", TestMethods},
 		{"--concurrent", TestConcurrency},
 		{"--concurrent", TestWebSocket},
+		{"--concurrent", TestBackoff},
 	}
 
 	for _, t := range tests {
@@ -360,5 +360,33 @@ func TestWebSocket(cx *context) {
 			dieMsgf("Socket %v received no pongs", sock.id)
 		}
 		sock.con.Close()
+	}
+}
+
+func TestBackoff(cx *context) {
+	size := 1024 * 1024 * 1024
+	req, err := http.NewRequest("GET", serverURL+fmt.Sprintf("/stream?bytes=%v", size), nil)
+	if err != nil {
+		dieMsgf("Failed to create request: %v", err)
+	}
+	resp, err := cx.client.Do(req)
+	defer resp.Body.Close()
+	mult := uint32(997)
+	expect := uint32(0)
+	buf := make([]byte, 4000, 0)
+	offset := 0
+	for i := 0; true; i++ {
+		n, err := resp.Body.Read(buf)
+		for j := 0; j < n; j++ {
+			expect = (expect + 1) * mult
+			if buf[j] != byte(expect&0xff) {
+				dieMsgf("Byte %v wrong. Expected %v, but got %v", offset+j, expect&0xff, buf[j])
+			}
+		}
+		offset += n
+		fmt.Printf("recv %v/%v\n", offset, size)
+		if i%100 == 0 {
+			time.Sleep(1 * time.Second)
+		}
 	}
 }
