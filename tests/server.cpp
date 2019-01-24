@@ -67,6 +67,12 @@ void RunSingleThread(phttp::Server& s) {
 				w.SetStatusAndBody(200, "");
 			else
 				w.SetStatusAndBody(200, r.Method + "-" + *r.HttpBody());
+		} else if (r.Path == "/digits") {
+			int    ndigits = r.QueryInt("num");
+			string body;
+			for (int i = 0; i < ndigits; i++)
+				body += '0' + (i % 10);
+			w.SetStatusAndBody(200, body);
 		} else {
 			w.SetStatus(404);
 		}
@@ -198,6 +204,13 @@ void ProcessingThread(ServerState* ss, phttp::Server* s) {
 			ProcessWSFrame(ss, r);
 		} else if (r->Path == "/echo-method") {
 			w.SetStatusAndBody(200, r->Method + "-MT-" + *r->HttpBody());
+			s->SendHttp(w);
+		} else if (r->Path == "/digits") {
+			int    ndigits = r->QueryInt("num");
+			string body;
+			for (int i = 0; i < ndigits; i++)
+				body += '0' + (i % 10);
+			w.SetStatusAndBody(200, body);
 			s->SendHttp(w);
 		} else if (r->Path == "/kill") {
 			//printf("Received kill\n");

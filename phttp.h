@@ -133,30 +133,47 @@ enum class WebSocketCloseReason {
 PHTTP_API bool Initialize();
 PHTTP_API void Shutdown();
 
+class Server;
+
+// Optional userdata that can be attached to a Request.
+// This is useful for associating information with a request.
+// For example, before processing a request, you might want to perform
+// authentication on it. Thereafter, any API function can make use of
+// that authentication information.
+class RequestUserData {
+public:
+	virtual ~RequestUserData() {}
+};
+
 /* A request, which is either an HTTP request, or an incoming WebSocket frame.
 */
 class PHTTP_API Request {
 public:
 	typedef std::vector<std::pair<std::string, std::string>> StrPairList;
 
-	RequestType Type          = RequestType::Null;
-	size_t      ContentLength = 0;     // Parsed from the Content-Length header
-	int64_t     ConnectionID  = 0;     // ID of the socket connection (but not literally the socket fd).
-	bool        IsChunked     = false; // True if this is a chunked request
-	std::string Version;               // "HTTP/1.0" or "HTTP/1.1"
-	StrPairList Headers;               // Headers
-	std::string Method;                // Method (GET,POST,DELETE,etc)
-	std::string URI;                   // URI
-	std::string RawPath;               // Path before performing URL unescaping
-	std::string Path;                  // Path with URL unescaping (ie %20 -> char(32))
-	std::string Fragment;              // The portion of the URL after the first #
-	std::string RawQuery;              // The portion of the URL after the first ?
-	StrPairList Query;                 // Parsed key+value pairs from RawQuery
+	phttp::Server*   Server        = nullptr;
+	RequestType      Type          = RequestType::Null;
+	size_t           ContentLength = 0;     // Parsed from the Content-Length header
+	int64_t          ConnectionID  = 0;     // ID of the socket connection (but not literally the socket fd).
+	bool             IsChunked     = false; // True if this is a chunked request
+	std::string      Version;               // "HTTP/1.0" or "HTTP/1.1"
+	StrPairList      Headers;               // Headers
+	std::string      Method;                // Method (GET,POST,DELETE,etc)
+	std::string      URI;                   // URI
+	std::string      RawPath;               // Path before performing URL unescaping
+	std::string      Path;                  // Path with URL unescaping (ie %20 -> char(32))
+	std::string      Fragment;              // The portion of the URL after the first #
+	std::string      RawQuery;              // The portion of the URL after the first ?
+	StrPairList      Query;                 // Parsed key+value pairs from RawQuery
+	RequestUserData* UserData = nullptr;    // User data that an HTTP service can attach to a request. Deleted when Request is destroyed
 
-	Request(int64_t connectionID, RequestType type);
+	Request(phttp::Server* server, int64_t connectionID, RequestType type);
+	~Request();
+
 	std::string        Header(const char* h) const;                                         // Returns first header found, or empty string. Header name match is case-insensitive
 	std::string        QueryVal(const char* key) const;                                     // Returns first value found, or empty string
 	int                QueryInt(const char* key) const;                                     // Returns first value found, or zero
+	int64_t            QueryInt64(const char* key) const;                                   // Returns first value found, or zero
 	double             QueryDbl(const char* key) const;                                     // Returns first value found, or zero
 	size_t             ReadBody(size_t start, void* dst, size_t maxLen, bool clear);        // Attempt to read maxLen bytes out of Body, starting at 'start'. Return number of bytes read. If clear, then erase bytes after reading.
 	size_t             ReadBody(size_t start, std::string& dst, size_t maxLen, bool clear); // Attempt to read maxLen bytes out of Body, starting at 'start', and append to 'dst'. Return number of bytes read. If clear, then erase bytes after reading.
@@ -198,6 +215,7 @@ public:
 	void   SetHeader(const std::string& header, const std::string& val);
 	void   SetStatus(int status);
 	void   SetStatusAndBody(int status, const std::string& body);
+	void   Send(); // A convenience function that calls Request->Server->SendHttp(*this);
 };
 
 // Logger interface
@@ -217,6 +235,23 @@ public:
 };
 
 typedef std::shared_ptr<Logger> LoggerPtr;
+
+// Expose a compressor to transparently compress all responses (with gzip, deflate, etc).
+// All methods of ICompressor must be callable from multiple threads.
+// The following two conditions disable transparent compression:
+// * Content-Encoding is set in the Response
+// * Content-Length is set in the Response
+class PHTTP_API Compressor {
+public:
+	virtual ~Compressor() {}
+
+	// Compress the body data. You must fill responseEncoding with the encoding that you've chosen (eg "gzip" or "deflate").
+	// If you return false, then the body is sent uncompressed.
+	virtual bool Compress(const std::string& acceptEncoding, const void* raw, size_t rawLen, void*& enc, size_t& encLen, std::string& responseEncoding) = 0;
+
+	// Free a buffer that you returned from Compress
+	virtual void Free(const std::string& acceptEncoding, void* enc) = 0;
+};
 
 /* phttp Server
 
@@ -238,11 +273,12 @@ public:
 	static const socket_t InvalidSocket = (socket_t)(~0);
 #endif
 
-	int               MaxConnections   = 4096; // You can raise this to 64k, but our use of poll() makes high socket numbers expensive
-	LoggerPtr         Log              = nullptr;
-	bool              LogAllEvents     = false; // If enabled, all socket events are logged
-	bool              LogInitialListen = true;  // Log initial bind
-	std::atomic<bool> StopSignal;               // Toggled by Stop()
+	int                MaxConnections   = 4096; // You can raise this to 64k, but our use of poll() makes high socket numbers expensive
+	LoggerPtr          Log              = nullptr;
+	bool               LogAllEvents     = false;   // If enabled, all socket events are logged
+	bool               LogInitialListen = true;    // Log initial bind
+	phttp::Compressor* Compressor       = nullptr; // If defined, this is used by SendHttp() to compress responses
+	std::atomic<bool>  StopSignal;                 // Toggled by Stop()
 
 	Server();
 

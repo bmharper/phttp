@@ -137,6 +137,18 @@ static void MakeDate(char* buf) {
 	sprintf(buf, "%s, %02d %s %04d %02d:%02d:%02d GMT", WeekDay[m.tm_wday], m.tm_mday, Months[m.tm_mon], m.tm_year + 1900, m.tm_hour, m.tm_min, m.tm_sec);
 }
 
+static int64_t atoi64(const char* s, size_t len) {
+	int64_t v = 0;
+	if (s[0] == '-') {
+		for (size_t i = 1; i < len; i++)
+			v = v * 10 - (s[i] - '0');
+	} else {
+		for (size_t i = 0; i < len; i++)
+			v = v * 10 + (s[i] - '0');
+	}
+	return v;
+}
+
 static uint64_t uatoi64(const char* s, size_t len) {
 	uint64_t v = 0;
 	for (size_t i = 0; i < len; i++)
@@ -196,7 +208,11 @@ static void Base64Encode(const uint8_t* raw, size_t len, char* enc) {
 	enc[0] = 0;
 }
 
-Request::Request(int64_t connectionID, RequestType type) : ConnectionID(connectionID), Type(type) {
+Request::Request(phttp::Server* server, int64_t connectionID, RequestType type) : Server(server), ConnectionID(connectionID), Type(type) {
+}
+
+Request::~Request() {
+	delete UserData;
 }
 
 std::string Request::Header(const char* h) const {
@@ -219,6 +235,14 @@ int Request::QueryInt(const char* key) const {
 	for (const auto& p : Query) {
 		if (p.first == key)
 			return atoi(p.second.c_str());
+	}
+	return 0;
+}
+
+int64_t Request::QueryInt64(const char* key) const {
+	for (const auto& p : Query) {
+		if (p.first == key)
+			return atoi64(p.second.c_str(), p.second.size());
 	}
 	return 0;
 }
@@ -335,6 +359,10 @@ void Response::SetStatus(int status) {
 void Response::SetStatusAndBody(int status, const std::string& body) {
 	Status = status;
 	Body   = body;
+}
+
+void Response::Send() {
+	Request->Server->SendHttp(*this);
 }
 
 PHTTP_API bool Initialize() {
@@ -595,7 +623,7 @@ void Server::AcceptOrReject() {
 	ConnectionPtr con = make_shared<Connection>();
 	con->Sock         = newSock;
 	con->ID           = NextReqID++;
-	con->Request      = make_shared<Request>(con->ID, RequestType::Http);
+	con->Request      = make_shared<Request>(this, con->ID, RequestType::Http);
 	{
 		lock_guard<mutex> lock(ConnectionsLock);
 		Connections.push_back(con);
@@ -710,7 +738,7 @@ bool Server::ReadFromWebSocketLoop(Connection* c, RequestPtr& r) {
 				}
 				// Return this request to the caller, and setup the connection to receive a new request
 				r          = c->Request;
-				c->Request = make_shared<Request>(c->ID, RequestType::Null);
+				c->Request = make_shared<Request>(this, c->ID, RequestType::Null);
 			}
 			c->Request->ClearBody();
 		}
@@ -992,9 +1020,26 @@ bool Server::SendHttpInternal(Response& w) {
 		return true;
 	}
 
+	string acceptEncoding = w.Request->Header("Accept-Encoding");
+	char*  bodyBuf        = const_cast<char*>(w.Body.data());
+	size_t bodyLen        = w.Body.size();
+	bool   mustFreeBody   = false;
+
+	if (Compressor && w.FindHeader("Content-Length") == -1 && w.FindHeader("Content-Encoding") == -1) {
+		void*  cbuf = nullptr;
+		size_t clen = 0;
+		string responseEncoding;
+		if (Compressor->Compress(acceptEncoding, w.Body.data(), w.Body.size(), cbuf, clen, responseEncoding)) {
+			bodyBuf      = (char*) cbuf;
+			bodyLen      = clen;
+			mustFreeBody = true;
+			w.SetHeader("Content-Encoding", responseEncoding);
+		}
+	}
+
 	char linebuf[1024];
 	if (w.FindHeader("Content-Length") == -1) {
-		sprintf(linebuf, "%llu", (unsigned long long) w.Body.size());
+		sprintf(linebuf, "%llu", (unsigned long long) bodyLen);
 		w.SetHeader("Content-Length", linebuf);
 	}
 
@@ -1030,10 +1075,11 @@ bool Server::SendHttpInternal(Response& w) {
 	}
 	wbuf.append("\r\n");
 
-	// It would be nice if we could avoid this memcpy of the body. Ideally, you'd have a flag on write()
-	// that would tell the kernel "OK, you can send now". We always set TCP_NODELAY, so we're
-	// forced to do our own buffering.
-	wbuf.append(w.Body);
+	// If body is above a thumbsuck threshold, then send it separately.
+	// We do this to avoid the expensive memcpy of a large response body.
+	bool sendBodySeparate = bodyLen > 4000;
+	if (!sendBodySeparate)
+		wbuf.append(bodyBuf, bodyLen);
 
 	if (isFinalResponse && keepAlive) {
 		// Reset the parser for another request. It is important that we reset to allow new data BEFORE
@@ -1044,7 +1090,15 @@ bool Server::SendHttpInternal(Response& w) {
 		ResetForAnotherHttpRequest(c);
 	}
 
-	if (!SendBytes(c.get(), wbuf.c_str(), wbuf.size()))
+	bool okSend1 = SendBytes(c.get(), wbuf.c_str(), wbuf.size());
+	bool okSend2 = true;
+	if (okSend1 && sendBodySeparate)
+		okSend2 = SendBytes(c.get(), bodyBuf, bodyLen);
+
+	if (mustFreeBody)
+		Compressor->Free(acceptEncoding, bodyBuf);
+
+	if (!(okSend1 && okSend2))
 		return false;
 
 	if (isFinalResponse && !keepAlive) {
@@ -1059,7 +1113,7 @@ void Server::ResetForAnotherHttpRequest(ConnectionPtr c) {
 	auto oldID          = c->ID;
 	c->State            = ConnectionState::HttpRecv;
 	c->ID               = NextReqID++;
-	c->Request          = make_shared<Request>(c->ID, RequestType::Http);
+	c->Request          = make_shared<Request>(this, c->ID, RequestType::Http);
 	c->IsHttpHeaderDone = false;
 	phttp_parser_init(&c->Parser);
 	if (LogAllEvents)
@@ -1262,6 +1316,8 @@ bool Server::ParsePath(Request* r) {
 				return false;
 			c = (HexToInt(s[i + 1]) << 4) | HexToInt(s[i + 2]);
 			i += 2;
+		} else if (c == '+') {
+			c = ' ';
 		}
 		r->Path += c;
 	}
@@ -1287,6 +1343,8 @@ bool Server::ParseQuery(Request* r) {
 				return false;
 			c = (HexToInt(s[i + 1]) << 4) | HexToInt(s[i + 2]);
 			i += 2;
+		} else if (c == '+') {
+			c = ' ';
 		}
 
 		if (!escaped && state == Key && c == '=') {

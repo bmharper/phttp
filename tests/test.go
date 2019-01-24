@@ -178,11 +178,23 @@ func (c *context) expect(method, url, body string, expectCode int, expectBody st
 	}
 }
 
+func digits(num int) string {
+	s := []byte{}
+	for i := 0; i < num; i++ {
+		s = append(s, '0'+byte(i%10))
+	}
+	return string(s)
+}
+
 func TestBasic(cx *context) {
 	for i := 0; i < 5000; i++ {
 		//fmt.Printf("Get %v - ", i)
 		cx.getExpect("/", 200, "Hello")
 		//fmt.Printf("have %v\n", i)
+	}
+
+	for num := 0; num < 1000000; num = int(float64(num)*1.1) + 1 {
+		cx.getExpect(fmt.Sprintf("/digits?num=%v", num), 200, digits(num))
 	}
 }
 
