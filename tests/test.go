@@ -25,6 +25,7 @@ import (
 	"runtime/pprof"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -73,11 +74,12 @@ func main() {
 	}
 
 	tests := []testFunc{
-		{"--ListenAndRun", TestBasic},
-		{"--ListenAndRun", TestMethods},
-		{"--concurrent", TestConcurrency},
-		{"--concurrent", TestWebSocket},
-		{"--concurrent", TestBackoff},
+		{"1", TestBasic},
+		{"1", TestMethods},
+		{"2", TestConcurrency},
+		{"2", TestWebSocketHello},
+		{"1", TestWebSocket},
+		{"2", TestBackoff},
 	}
 
 	for _, t := range tests {
@@ -121,12 +123,12 @@ func newContext(runMode string) *context {
 	var err error
 	c := &context{}
 	if !externalServer {
-		c.server = exec.Command("./server")
+		c.server = exec.Command("build/server")
 		c.server.Args = append(c.server.Args, runMode)
 		c.server.Stdout = os.Stdout
 		err = c.server.Start()
 		if err != nil {
-			die(err)
+			dieMsgf("Failed to launch build/server: %v", err)
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
@@ -139,7 +141,7 @@ func (c *context) close() {
 		// I don't know how else to send a kill signal to a windows process, so we reserve
 		// a special HTTP message for that.
 		c.client.Get(serverURL + "/kill")
-		time.Sleep(100 * time.Millisecond)
+		time.Sleep(500 * time.Millisecond)
 		c.server.Process.Signal(os.Kill)
 		//c.server.Process.Kill()
 		c.server.Wait()
@@ -217,16 +219,16 @@ func TestConcurrency(cx *context) {
 	nthread := 2
 	done := make(chan bool, nthread)
 	//start := time.Now()
-	num := 5000
+	num := 10000
 	for i := 0; i < nthread; i++ {
 		myID := i
 		go func() {
 			for j := 0; j < num; j++ {
-				if j%100 == 0 {
-					//fmt.Printf("Thread %v, %v/%v\n", myID, j, num)
-				}
+				//if j%500 == 0 {
+				//	fmt.Printf("Thread %v, %v/%v\n", myID, j, num)
+				//}
 				body := fmt.Sprintf("%v-%v", myID, j)
-				cx.expect("POST", "/echo-method", body, 200, "POST-MT-"+body)
+				cx.expect("POST", "/echo-method", body, 200, "POST-"+body)
 			}
 			done <- true
 		}()
@@ -246,6 +248,41 @@ type WebSocket struct {
 	numPongs int
 }
 
+func TestWebSocketHello(cx *context) {
+	dial := websocket.Dialer{}
+	for useCloseFrame := 0; useCloseFrame < 2; useCloseFrame++ {
+		con, _, err := dial.Dial(serverURL_WS, http.Header{})
+		if err != nil {
+			dieMsgf("Failed to connect to websocket: %v", err)
+		}
+		mtype, r, err := con.NextReader()
+		if err != nil {
+			dieMsgf("Failed to get NextReader: %v", err)
+		}
+		if mtype != websocket.TextMessage {
+			dieMsgf("Expected text message (1), but got: %v", mtype)
+		}
+		buf, err := ioutil.ReadAll(r)
+		if err != nil {
+			dieMsgf("Error reading from websocket: %v", err)
+		}
+		val := string(buf)
+		if val != "-1" {
+			dieMsgf("Expected '-1', but server sent '%v'", val)
+		}
+		if useCloseFrame == 1 {
+			msg := websocket.FormatCloseMessage(websocket.CloseNormalClosure, "goobye!")
+			con.WriteControl(websocket.CloseMessage, msg, time.Now().Add(100*time.Millisecond))
+			time.Sleep(200 * time.Millisecond)
+			con.Close()
+		} else {
+			con.Close()
+		}
+	}
+}
+
+// This tests needs to be run with a single thread on the server, otherwise the message ordering gets
+// messed up, and the simple assumptions that are asserted against, fail.
 func TestWebSocket(cx *context) {
 	dial := websocket.Dialer{}
 	socks := []*WebSocket{}
@@ -278,8 +315,8 @@ func TestWebSocket(cx *context) {
 	done := make(chan bool)
 
 	// These two don't need to be tied together. The server keeps sending messages until we kill it.
-	numRecv := 1000
-	numWrite := 1000
+	numRecv := 2000
+	numWrite := 2000
 
 	// reader thread
 	go func() {
@@ -336,7 +373,10 @@ func TestWebSocket(cx *context) {
 			if err != nil || n != len(msg) {
 				dieMsgf("Error writing to websocket (%v, %v)", err, n)
 			}
-			w.Close()
+			err = w.Close()
+			if err != nil {
+				dieMsgf("Error closing websocket writer (%v)", err)
+			}
 			//fmt.Printf("Sent to %v: %v\n", sock.id, sock.lastSent)
 		}
 
@@ -364,29 +404,66 @@ func TestWebSocket(cx *context) {
 }
 
 func TestBackoff(cx *context) {
-	size := 1024 * 1024 * 1024
-	req, err := http.NewRequest("GET", serverURL+fmt.Sprintf("/stream?bytes=%v", size), nil)
-	if err != nil {
-		dieMsgf("Failed to create request: %v", err)
-	}
-	resp, err := cx.client.Do(req)
-	defer resp.Body.Close()
-	mult := uint32(997)
-	expect := uint32(0)
-	buf := make([]byte, 4000, 0)
-	offset := 0
-	for i := 0; true; i++ {
-		n, err := resp.Body.Read(buf)
-		for j := 0; j < n; j++ {
-			expect = (expect + 1) * mult
-			if buf[j] != byte(expect&0xff) {
-				dieMsgf("Byte %v wrong. Expected %v, but got %v", offset+j, expect&0xff, buf[j])
-			}
+	// make this true to see numbers. you should see the MB/s rise as you increase the number of simultaneous connections
+	// Also, on the C++ side, you should see at least a few "." printouts, among the many "*" printouts. If you don't see
+	// any ".", then we're never stressing the "buffer full" detection system.
+	verbose := false
+	size := 5 * 1024 * 1024
+	for numReq := 1; numReq <= 16; numReq *= 2 {
+		if verbose {
+			fmt.Printf("%v simultaneous requests\n", numReq)
 		}
-		offset += n
-		fmt.Printf("recv %v/%v\n", offset, size)
-		if i%100 == 0 {
-			time.Sleep(1 * time.Second)
+		start := time.Now()
+		totalRecv := int64(0)
+		done := make(chan bool, numReq)
+		launch := func(threadid int) {
+			req, err := http.NewRequest("GET", serverURL+fmt.Sprintf("/stream?bytes=%v", size), nil)
+			if err != nil {
+				dieMsgf("Failed to create request: %v", err)
+			}
+			resp, err := cx.client.Do(req)
+			//fmt.Printf("start\n")
+			defer resp.Body.Close()
+			mult := uint32(997)
+			expect := uint32(0)
+			buf := make([]byte, 10000)
+			offset := 0
+			for i := 0; true; i++ {
+				//fmt.Printf("recv %v/%v\n", offset, size)
+				n, err := resp.Body.Read(buf)
+				if numReq == 1 {
+					//fmt.Printf("recv %v - %v (%v) (%v/%v)\n", offset, offset+n, n, offset+n, size)
+				}
+				for j := 0; j < n; j++ {
+					expect = (expect + 1) * mult
+					if buf[j] != byte(expect&0xff) {
+						dieMsgf("Byte %v wrong. Expected %v, but got %v (read %v bytes)", offset+j, expect&0xff, buf[j], n)
+					}
+				}
+				offset += n
+				atomic.AddInt64(&totalRecv, int64(n))
+				if verbose && threadid == 0 && i%100 == 0 {
+					fmt.Printf("MB/Second: %.1f\n", (float64(totalRecv)/(1024.0*1024.4))/time.Now().Sub(start).Seconds())
+				}
+				if err != nil {
+					if err == io.EOF && offset == size {
+						break
+					}
+					dieMsgf("Error reading from body: %v (bytes remaining %v)\n", err, size-offset)
+				}
+				//fmt.Printf("recv %v/%v\n", offset, size)
+				if i%20 == 0 {
+					time.Sleep(70 * time.Millisecond)
+				}
+			}
+			done <- true
+		}
+		for i := 0; i < numReq; i++ {
+			go launch(i)
+		}
+
+		for i := 0; i < numReq; i++ {
+			<-done
 		}
 	}
 }

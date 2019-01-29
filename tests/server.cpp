@@ -55,32 +55,6 @@ void sleepnano(int64_t nanoseconds) {
 }
 #endif
 
-void RunSingleThread(phttp::Server& s) {
-	s.ListenAndRun(BindAddress, Port, [&s](phttp::Response& w, phttp::Request& r) {
-		if (r.Path == "/") {
-			w.SetStatusAndBody(200, "Hello");
-		} else if (r.Path == "/kill") {
-			w.SetStatus(200);
-			s.Stop();
-		} else if (r.Path == "/echo") {
-			w.SetStatusAndBody(200, *r.HttpBody());
-		} else if (r.Path == "/echo-method") {
-			if (r.Method == "HEAD")
-				w.SetStatusAndBody(200, "");
-			else
-				w.SetStatusAndBody(200, r.Method + "-" + *r.HttpBody());
-		} else if (r.Path == "/digits") {
-			int    ndigits = r.QueryInt("num");
-			string body;
-			for (int i = 0; i < ndigits; i++)
-				body += '0' + (i % 10);
-			w.SetStatusAndBody(200, body);
-		} else {
-			w.SetStatus(404);
-		}
-	});
-}
-
 template <typename T>
 class Queue {
 public:
@@ -116,8 +90,9 @@ struct ServerState {
 	atomic<bool>             Exit;
 	Queue<phttp::RequestPtr> HttpQ;
 
-	mutex                       WSLock;     // Guards access to all websocket state
-	unordered_map<int64_t, int> WSLastRecv; // Key = websocket ID. Value = latest number received from client
+	mutex                               WSLock;     // Guards access to all websocket state
+	unordered_map<int64_t, int>         WSLastRecv; // Key = websocket ID. Value = latest number received from client
+	unordered_map<int64_t, vector<int>> WSHistory;  // Key = websocket ID. Value = all values received from client
 
 	Queue<phttp::RequestPtr> StreamQ;
 
@@ -143,14 +118,24 @@ void ProcessWSFrame(ServerState* ss, phttp::RequestPtr r) {
 	lock_guard<mutex> lock(ss->WSLock);
 	int               val = atoi(r->Frame().c_str());
 	if (ss->WSLastRecv.find(r->ConnectionID) == ss->WSLastRecv.end()) {
-		printf("Received value %d on unknown websocket id %d (occurs sometimes at start)", val, (int) r->ConnectionID);
+		printf("Received value %d on unknown websocket id %d (occurs sometimes at start) (A)", val, (int) r->ConnectionID);
+		return;
+	}
+	if (ss->WSHistory.find(r->ConnectionID) == ss->WSHistory.end()) {
+		printf("Received value %d on unknown websocket id %d (occurs sometimes at start) (B)", val, (int) r->ConnectionID);
 		return;
 	}
 
 	int prev = ss->WSLastRecv[r->ConnectionID];
 	if (val <= prev) {
+		auto history = ss->WSHistory[r->ConnectionID];
+		printf("\nhistory:\n");
+		for (size_t i = 0; i < history.size(); i++) {
+			printf("%d: %d\n", (int) i, history[i]);
+		}
 		Die("Received invalid value %d on websocket id %d. Expected higher than %d", val, (int) r->ConnectionID, prev);
 	} else {
+		ss->WSHistory[r->ConnectionID].push_back(val);
 		ss->WSLastRecv[r->ConnectionID] = val;
 	}
 }
@@ -204,8 +189,13 @@ void StreamThread(ServerState* ss, phttp::Server* s) {
 		uint32_t          Val  = 0;
 	};
 	vector<Stream> streams;
-	byte           buf[4000];
-	uint32_t       mul = 997;
+	byte           buf[10000];
+	uint32_t       mul     = 997;
+	int            sleepMS = 0;
+	// uncomment this to see when we're sending, and when we're sleeping.
+	// If there aren't at least a few sleep printouts, then the system isn't
+	// actually being tested.
+	bool printStatus = false;
 
 	while (!s->StopSignal) {
 		auto newReq = ss->StreamQ.Pop();
@@ -214,14 +204,52 @@ void StreamThread(ServerState* ss, phttp::Server* s) {
 			s.R    = newReq;
 			s.Size = newReq->QueryInt64("bytes");
 			streams.push_back(s);
+			auto w = phttp::Response::MakeMultiHead(s.R);
+			char clen[100];
+			sprintf(clen, "%lld", (long long) s.Size);
+			w.SetHeader("Content-Type", "text/plain");
+			w.SetHeader("Content-Length", clen);
+			w.Send();
 		}
+		int nActive = 0;
 		for (size_t i = 0; i < streams.size(); i++) {
-			auto&   s     = streams[i];
-			int64_t nSend = min<int64_t>(s.Size - s.Pos, sizeof(buf));
+			auto& s   = streams[i];
+			auto  cap = s.R->SendCapacity();
+			if (cap == -1) {
+				printf("Download aborted by client\n");
+				streams.erase(streams.begin() + i);
+				i--;
+				continue;
+			} else if (cap == 0) {
+				// send buffer is full
+				continue;
+			}
+			nActive++;
+			size_t nSend = min<size_t>(size_t(s.Size - s.Pos), sizeof(buf));
 			for (int64_t j = 0; j < nSend; j++) {
 				s.Val  = (s.Val + 1) * mul;
 				buf[j] = byte(s.Val & 0xff);
 			}
+			auto w = phttp::Response::MakeMultiBody(s.R, buf, (size_t) nSend);
+			s.Pos += nSend;
+			w.Send();
+			if (nSend == 0) {
+				// stream is finished
+				streams.erase(streams.begin() + i);
+				i--;
+			}
+		}
+		// adjust sleep time
+		if (nActive == 0) {
+			sleepMS = max(sleepMS, 1) * 2; // exponential rise in sleep time
+			sleepMS = min(sleepMS, 500);   // max sleep 500ms
+			if (printStatus && sleepMS > 100 && streams.size() != 0)
+				printf(".");
+			sleepnano(sleepMS * 1000000);
+		} else {
+			if (printStatus && streams.size() != 0)
+				printf("*");
+			sleepMS = 0;
 		}
 	}
 }
@@ -244,37 +272,48 @@ void ProcessingThread(ServerState* ss, phttp::Server* s) {
 			s->SendHttp(w);
 			lock_guard<mutex> lock(ss->WSLock);
 			ss->WSLastRecv.insert({r->ConnectionID, -1});
+			ss->WSHistory.insert({r->ConnectionID, {}});
 		} else if (r->IsWebSocketClose()) {
 			lock_guard<mutex> lock(ss->WSLock);
 			ss->WSLastRecv.erase(r->ConnectionID);
+			ss->WSHistory.erase(r->ConnectionID);
 		} else if (r->IsWebSocketFrame()) {
 			ProcessWSFrame(ss, r);
+		} else if (r->Path == "/") {
+			w.SetStatusAndBody(200, "Hello");
+			w.Send();
+		} else if (r->Path == "/echo") {
+			w.SetStatusAndBody(200, *r->HttpBody());
+			w.Send();
 		} else if (r->Path == "/echo-method") {
-			w.SetStatusAndBody(200, r->Method + "-MT-" + *r->HttpBody());
-			s->SendHttp(w);
+			if (r->Method == "HEAD")
+				w.SetStatusAndBody(200, "");
+			else
+				w.SetStatusAndBody(200, r->Method + "-" + *r->HttpBody());
+			w.Send();
 		} else if (r->Path == "/digits") {
 			int    ndigits = r->QueryInt("num");
 			string body;
 			for (int i = 0; i < ndigits; i++)
 				body += '0' + (i % 10);
 			w.SetStatusAndBody(200, body);
-			s->SendHttp(w);
+			w.Send();
 		} else if (r->Path == "/stream") {
-			int bytes = r->QueryInt64("bytes");
+			ss->StreamQ.Push(r);
 		} else if (r->Path == "/kill") {
 			//printf("Received kill\n");
 			w.SetStatus(200);
-			s->SendHttp(w);
+			w.Send();
 			s->Stop();
 			//printf("Stopping\n");
 		} else {
 			w.SetStatus(404);
-			s->SendHttp(w);
+			w.Send();
 		}
 	}
 }
 
-int RunMultiThread(phttp::Server& s) {
+int RunMultiThread(phttp::Server& s, int nProcessingThreads) {
 	if (!s.Listen(BindAddress, Port)) {
 		printf("Failed to listen\n");
 		return 1;
@@ -282,7 +321,6 @@ int RunMultiThread(phttp::Server& s) {
 
 	//s.LogAllEvents = true;
 
-	int            nProcessingThreads = 2;
 	vector<thread> threads;
 	ServerState    ss;
 	ss.Exit = false;
@@ -318,26 +356,22 @@ int main(int argc, char** argv) {
 	phttp::Server s;
 	SingleServer = &s;
 	if (argc != 2) {
-		printf("Must specify run mode such as --ListenAndRun");
+		printf("Must specify number of processing threads\n");
 		return 1;
 	}
-	string runMode = argv[1];
+	int nthreads = atoi(argv[1]);
+	if (nthreads <= 0) {
+		printf("Number of threads must be at least 1\n");
+		return 1;
+	}
 
 	bool enableLogs    = true;
 	auto log           = std::make_shared<phttp::FileLogger>(enableLogs ? stdout : nullptr);
 	s.LogInitialListen = false;
 	s.Log              = log;
-	//s.LogAllEvents  = true;
+	s.LogAllEvents     = false;
 
 	phttp::Initialize();
 
-	if (runMode == "--ListenAndRun") {
-		RunSingleThread(s);
-		return 0;
-	} else if (runMode == "--concurrent") {
-		return RunMultiThread(s);
-	} else {
-		printf("Unknown run mode %s\n", runMode.c_str());
-		return 1;
-	}
+	return RunMultiThread(s, nthreads);
 }

@@ -6,7 +6,7 @@
 *.ilk
 *.pdb
 .vs
-demo
+/demo
 tests/server
 tests/test
 /build

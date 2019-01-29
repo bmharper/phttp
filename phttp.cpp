@@ -9,6 +9,7 @@
 
 #ifdef _WIN32
 #include <io.h>
+#include <fcntl.h>
 #else
 #include <arpa/inet.h>
 #include <netinet/tcp.h>
@@ -36,6 +37,9 @@ typedef LONG          nfds_t;
 
 int poll(_Inout_ LPWSAPOLLFD fdArray, _In_ ULONG fds, _In_ INT timeout) {
 	return WSAPoll(fdArray, fds, timeout);
+}
+int pipe(int* fds) {
+	return _pipe(fds, 64, _O_BINARY);
 }
 // WriteV returns X:
 // X >=  0 : Wrote X bytes. If X is less than total bytes in buffers, then it was a partial write, and the OS buffer is full.
@@ -379,13 +383,15 @@ Response::Response(RequestPtr request) : Request(request) {
 
 Response Response::MakeMultiHead(RequestPtr request) {
 	Response r(request);
-	r.Type = Types::MultiHead;
+	r.Status = 200;
+	r.Type   = Types::MultiHead;
 	return r;
 }
 
 Response Response::MakeMultiBody(RequestPtr request, const void* buf, size_t len) {
 	Response r(request);
-	r.Type = Types::MultiBody;
+	r.Status = 200;
+	r.Type   = Types::MultiBody;
 	r.Body.assign((const char*) buf, len);
 	return r;
 }
@@ -490,16 +496,23 @@ bool Server::ConnectionSendSanity::Enter(Connection* c, const char* typeOfSend) 
 		c->Owner->WriteLog("[%5lld] Attempt to send %s message from more than one thread simultaneously", (long long) c->ID, typeOfSend);
 		return false;
 	}
+	C = c;
 	return true;
 }
 
+void Server::ConnectionSendSanity::Exit() {
+	if (C)
+		C->IsSendBusy = false;
+}
+
 Server::ConnectionSendSanity::~ConnectionSendSanity() {
-	C->IsSendBusy = false;
+	Exit();
 }
 
 Server::Server() {
 	NextReqID = 1;
-	memset(ClosePipe, 0, sizeof(ClosePipe));
+	FastTick  = 0;
+	memset(WakePipe, 0, sizeof(WakePipe));
 }
 
 bool Server::ListenAndRun(const char* bindAddress, int port, std::function<void(Response& w, Request& r)> handler) {
@@ -534,8 +547,7 @@ bool Server::Listen(const char* bindAddress, int port) {
 	// This avoids "socket already in use" errors when frequently restarting server on linux
 	int optval = 1;
 	setsockopt(ListenSock, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval));
-
-	if (pipe(ClosePipe) == -1) {
+	if (pipe(WakePipe) == -1) {
 		WriteLog("pipe() failed: %d", LastError());
 		return false;
 	}
@@ -588,55 +600,111 @@ void Server::Stop() {
 	StopSignal = true;
 	if (ListenSock != InvalidSocket) {
 #ifdef _WIN32
+		// WSAPoll cannot listen on a pipe, so we have no choice here, but to close the socket.
 		closesocket(ListenSock);
 		ListenSock = InvalidSocket;
 #else
-		// Write a dummy byte into ClosePipe, to wake poll() up, so we can exit cleanly.
+		// Write a dummy byte into WakePipe, to wake poll() up, so we can exit cleanly.
 		// The linux docs say that it's illegal to close() a socket from another thread,
 		// while you're busy waiting on it with a select() or poll(), so we use a pipe
 		// here instead.
-		write(ClosePipe[1], "x", 1);
+		WakePoll();
 #endif
 	}
 }
 
+// Problem:
+// On Windows, we use WSAPoll, which can only listen on SOCKETs. On Unix, poll() can listen on any
+// file descriptor, including a pipe.
+// The key problem is that we want to go into as deep a sleep as possible, but
+// still be woken up the moment something occurs. Sometimes, that "something occurs" moment is
+// a state that we have produced ourselves. See Server::SendBytes(), where WakePoll() is called.
+//
+// So, we have this problem on Windows, that if we make our timeout infinite, then we have no
+// way of waking ourselves up out of the WSAPoll() call. The workaround that we do, is to use
+// a non-infinite timeout. The only question then, is how big to make that timeout. If we make
+// it too small, we burn unnecessary CPU time, and if we make it too big, then we reduce performance,
+// particularly when sending data. Receiving data is not affected.
+//
+// Whenever we have a full send buffer, we set FastTick = 100. Then, every time we don't have
+// a full send buffer, we lower FastTick by 1. If FastTick becomes negative, then we're in slow
+// tick mode.
 std::vector<RequestPtr> Server::Recv() {
-	std::vector<RequestPtr> requests;
+	vector<RequestPtr> requests;
 	while (true) {
+		enum {
+			LISTEN_SOCK = 0, // fds[LISTEN_SOCK]
+			WAKE_PIPE   = 1, // fds[WAKE_PIPE] (only on unix)
+		};
 		vector<pollfd> fds;
 		size_t         reqStart = 0;
 		{
 			lock_guard<mutex> lock(ConnectionsLock);
 			fds.reserve(2 + Connections.size());
 
-			// The code down below which does the Accept() assumes ListenSock is fds[0]
+			// See LISTEN_SOCK and other enums above for assumed ordering of first few 'fds' entries
 			fds.push_back({ListenSock, POLLIN, 0});
+
+			// WakePipe is used to wake us under two conditions:
+			// 1. When the server needs to exit (ie StopSignal is true)
+			// 2. When a new socket enters the "waiting for send capacity" state. In this case, our call to
+			//    poll() may be stuck waiting for new incoming data, and we would wait there forever, if we
+			//    didn't cancel the poll() call, and start it again, this time including the POLLOUT flag.
+			//    Prior to entering the "waiting for send capacity" state, we were only listening for POLLIN
+			//    on that socket.
 #ifndef _WIN32
-			// On WIN32, we just close ListenSock, which is fine. Linux says that's illegal to do that from a different thread, so we use a special pipe to wake us up on linux.
-			fds.push_back({ClosePipe[0], POLLIN, 0});
+			fds.push_back({WakePipe[0], POLLIN, 0});
 #endif
-			reqStart = fds.size();
+
+			reqStart          = fds.size();
+			bool haveOutQueue = false;
 			for (auto c : Connections) {
 				short events = POLLIN;
-				if (c->OutQueueHasData)
+				if (c->OutQueueHasData) {
+					haveOutQueue = true;
 					events |= POLLOUT;
+				}
 				fds.push_back({c->Sock, events, 0});
 			}
+
+			if (haveOutQueue)
+				FastTick = 100;
+			else
+				FastTick--;
 		}
 
-		//printf("poll in (%d)\n", (int) Connections.size());
-		int n = poll(&fds[0], (nfds_t) fds.size(), -1);
+		int timeout = -1;
+#ifdef _WIN32
+		if (FastTick > 0)
+			timeout = 100;
+		else if (fds.size() > 1)
+			timeout = 1000;
+#endif
+
+		//printf("poll in (%d, FastTick=%d)\n", (int) Connections.size(), (int) FastTick.load());
+		int n = poll(&fds[0], (nfds_t) fds.size(), timeout);
 		//printf("poll out\n");
 
 		if (StopSignal)
 			return {};
-		if (n <= 0) {
-			WriteLog("poll failed. errno: %v", errno);
+		if (n == ErrSOCKET_ERROR) {
+			WriteLog("poll() failed. error: %d", LastError());
 			return {};
 		}
+		if (n == 0)
+			continue;
 
-		if (!!(fds[0].revents & POLLIN))
+		if (!!(fds[LISTEN_SOCK].revents & POLLIN))
 			AcceptOrReject();
+
+#ifndef _WIN32
+		if (!!(fds[WAKE_PIPE].revents & POLLIN)) {
+			// drain pipe. hopefully 64 is enough. We also have WakeSignaled to help prevent too many 'wake' messages in the pipe
+			char junk[64];
+			read(WakePipe[0], junk, sizeof(junk));
+			WakeSignaled = false;
+		}
+#endif
 
 		for (size_t i = reqStart; i < fds.size(); i++) {
 			if (!!(fds[i].revents & POLLNVAL)) {
@@ -646,7 +714,8 @@ std::vector<RequestPtr> Server::Recv() {
 
 			bool canRead  = !!(fds[i].revents & POLLIN);
 			bool canWrite = !!(fds[i].revents & POLLOUT);
-			if (canRead || canWrite) {
+			bool hungup   = !!(fds[i].revents & POLLHUP);
+			if (canRead || canWrite || hungup) {
 				ConnectionPtr c;
 				{
 					lock_guard<mutex> lock(ConnectionsLock);
@@ -658,6 +727,7 @@ std::vector<RequestPtr> Server::Recv() {
 					c = con->second;
 				}
 
+				bool isWebSocket = c->State == ConnectionState::WebSocket;
 				if (canWrite) {
 					if (!SendBytes(c.get(), {}))
 						CloseConnection(c);
@@ -666,10 +736,18 @@ std::vector<RequestPtr> Server::Recv() {
 				}
 				if (canRead && (c->State == ConnectionState::HttpRecv || c->State == ConnectionState::WebSocket)) {
 					RequestPtr r;
-					if (!ReadFromConnection(c.get(), r))
+					if (!ReadFromConnection(c.get(), r)) {
+						if (isWebSocket)
+							r = make_shared<Request>(this, c->ID, RequestType::WebSocketClose);
 						CloseConnection(c);
+					}
 					if (r != nullptr)
 						requests.push_back(r);
+				}
+				if (hungup) {
+					if (isWebSocket)
+						requests.push_back(make_shared<Request>(this, c->ID, RequestType::WebSocketClose));
+					CloseConnection(c);
 				}
 			}
 		}
@@ -738,11 +816,11 @@ bool Server::ReadFromConnection(Connection* c, RequestPtr& r) {
 
 	int nread = recv(c->Sock, (char*) RecvBuf, (int) RecvBufCap, 0);
 	if (nread < 0) {
-		WriteLog("[%5lld %5d] recv error %d %d. closing socket", (long long) c->ID, (int) c->Sock, nread, LastError());
+		WriteLog("[%5lld %5d] recv error %d %d. closing socket (nread < 0)", (long long) c->ID, (int) c->Sock, nread, LastError());
 		return false;
 	} else if (nread == 0) {
 		if (LogAllEvents)
-			WriteLog("[%5lld %5d] socket closed on recv", (long long) c->ID, (int) c->Sock);
+			WriteLog("[%5lld %5d] socket closed on recv (nread == 0)", (long long) c->ID, (int) c->Sock);
 		return false;
 	}
 
@@ -1190,6 +1268,7 @@ bool Server::SendHttpInternal(Response& w) {
 		// to contact us on the socket with a new request, and if we didn't prepare the socket to receive
 		// right here, then we'd have a race condition where the client could be requesting on the socket,
 		// and we would not be ready to receive it.
+		sanity.Exit();
 		ResetForAnotherHttpRequest(c);
 	}
 
@@ -1241,14 +1320,43 @@ void Server::ResetForAnotherHttpRequest(ConnectionPtr c) {
 	}
 }
 
+// Wake us up from our poll() call.
+// Unfortunately this doesn't work on Windows, because WSAPoll can only listen for changes to SOCKETs, not
+// generic file descriptors or anything else.
+void Server::WakePoll() {
+#ifndef _WIN32
+	bool expect = false;
+	if (!WakeSignaled.compare_exchange_strong(expect, true))
+		return;
+	write(WakePipe[1], "x", 1);
+#endif
+}
+
+bool Server::SendWebSocket(int64_t connectionID, RequestType type, const std::string& buf) {
+	return TransmitWebSocket(true, connectionID, type, buf.c_str(), buf.size());
+}
+
 bool Server::SendWebSocket(int64_t connectionID, RequestType type, const void* buf, size_t len) {
+	return TransmitWebSocket(true, connectionID, type, buf, len);
+}
+
+bool Server::TransmitWebSocket(bool ensureSingleCaller, int64_t connectionID, RequestType type, const void* buf, size_t len) {
 	auto c = ConnectionFromID(connectionID);
 	if (c == nullptr)
 		return false;
 
+	// We only perform this check when the API is called by user code. Internally, we have a mutex
+	// at the TCP socket level, which is checked inside SendBytes(). So it's OK for the user to be
+	// transmitting a websocket frame, while at the same time, we are busy responding to a
+	// Close() message, by transmitting our own Close frame. The ordering in that situation is obviously
+	// not guaranteed, but the frames will be correctly formatted, and they will not interleave.
+	// Also, it's legal to close a websocket connection at any time, which is why we never attempt
+	// to stop a simultaneous close, with a simultaneous send.
 	ConnectionSendSanity sanity;
-	if (!sanity.Enter(c.get(), "WebSocket"))
-		return false;
+	if (ensureSingleCaller) {
+		if (!sanity.Enter(c.get(), "WebSocket"))
+			return false;
+	}
 
 	WebSocketFrameType ft = WebSocketFrameType::Unknown;
 	switch (type) {
@@ -1282,11 +1390,11 @@ bool Server::SendWebSocket(int64_t connectionID, RequestType type, const void* b
 		*h++           = (byte) len64;
 	}
 
-	string wbuf;
-	wbuf.append((char*) head, h - head);
-	wbuf.append((const char*) buf, len);
+	vector<OutBuf> buffers;
+	buffers.push_back(OutBuf(head, h - head));
+	buffers.push_back(OutBuf(buf, len));
 
-	if (!SendBytes(c.get(), wbuf.c_str(), wbuf.size())) {
+	if (!SendBytes(c.get(), buffers)) {
 		CloseConnection(c);
 		return false;
 	}
@@ -1300,10 +1408,6 @@ bool Server::SendWebSocket(int64_t connectionID, RequestType type, const void* b
 	return true;
 }
 
-bool Server::SendWebSocket(int64_t connectionID, RequestType type, const std::string& buf) {
-	return SendWebSocket(connectionID, type, buf.c_str(), buf.size());
-}
-
 void Server::CloseWebSocket(int64_t connectionID, WebSocketCloseReason reason, const void* message, size_t messageLen) {
 	byte     code[2];
 	uint16_t r16 = (uint16_t) reason;
@@ -1313,7 +1417,7 @@ void Server::CloseWebSocket(int64_t connectionID, WebSocketCloseReason reason, c
 	wbuf.append((const char*) code, 2);
 	if (message)
 		wbuf.append((const char*) message, messageLen);
-	SendWebSocket(connectionID, RequestType::WebSocketClose, wbuf.c_str(), wbuf.size());
+	TransmitWebSocket(false, connectionID, RequestType::WebSocketClose, wbuf.c_str(), wbuf.size());
 }
 
 void Server::CloseWebSocket(int64_t connectionID, WebSocketCloseReason reason, const std::string& message) {
@@ -1447,26 +1551,17 @@ bool Server::SendBytes(Connection* c, std::vector<OutBuf> buffers) {
 
 	c->OutQueueHasData = c->OutQueue.size() != 0;
 
-	return true;
-
-	/*
-	size_t sent = 0;
-	while (sent != len) {
-		if (StopSignal)
-			return false;
-		size_t trySend = std::min(len - sent, (size_t) 1048576);
-		int    nsend   = send(c->Sock, buf + sent, (int) trySend, 0);
-		if (nsend < 0) {
-			WriteLog("[%5lld %5d] send error %d %d", (long long) c->ID, (int) c->Sock, nsend, LastError());
-			return false;
-		} else if (nsend == 0) {
-			WriteLog("[%5lld %5d] socket closed on send", (long long) c->ID, (int) c->Sock);
-			return false;
-		}
-		sent += nsend;
+	if (orgOutQueueSize == 0 && c->OutQueue.size() != 0) {
+		// We have entered a state where we need to wait for the OS to tell us when the TCP buffer
+		// has capacity, so that we can once again write to it. It's very likely that we're busy
+		// right now, on another thread, in a call to poll(), and that this socket is only being
+		// monitored for POLLIN. After we call poll() loop wakes up, it will notice that
+		// OutQueueHasData == true for this socket, and it will then listen not just for POLLIN,
+		// but also for POLLOUT.
+		WakePoll();
 	}
+
 	return true;
-	*/
 }
 
 bool Server::SendWebSocketPong(Connection* c) {
@@ -1587,7 +1682,6 @@ void Server::CloseConnectionByID(int64_t id) {
 }
 
 void Server::CloseConnection(ConnectionPtr c) {
-	//bool isWebSocket = c->IsWebSocket();
 	{
 		lock_guard<mutex> lock(ConnectionsLock);
 		if (ID2Connection.find(c->ID) == ID2Connection.end()) {
@@ -1608,17 +1702,6 @@ void Server::CloseConnection(ConnectionPtr c) {
 	}
 	if (LogAllEvents)
 		WriteLog("[%5lld %5d] socket closed", (long long) c->ID, (int) c->Sock);
-	/*
-	if (isWebSocket && Handler) {
-		// Notify synchronous ListenAndRun handler that websocket is closed
-		Request cr(c->ID);
-		cr.Type = RequestType::WebSocketClose;
-		Response w;
-		Handler(w, cr);
-		if (w.Body.size() != 0 || w.Status != 0)
-			WriteLog("[%5lld %5d] attempt to send message in response to WebSocketClose", (long long) c->ID, (int) 0);
-	}
-	*/
 }
 
 void Server::Cleanup() {
@@ -1634,11 +1717,11 @@ void Server::Cleanup() {
 	Sock2Connection.clear();
 	ID2Connection.clear();
 
-	if (ClosePipe[0])
-		close(ClosePipe[0]);
-	if (ClosePipe[1])
-		close(ClosePipe[1]);
-	memset(ClosePipe, 0, sizeof(ClosePipe));
+	if (WakePipe[0])
+		close(WakePipe[0]);
+	if (WakePipe[1])
+		close(WakePipe[1]);
+	memset(WakePipe, 0, sizeof(WakePipe));
 
 	free(RecvBuf);
 	RecvBuf      = nullptr;

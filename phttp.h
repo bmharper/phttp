@@ -322,7 +322,8 @@ public:
 	// Send an HTTP response. This can be called from multiple threads.
 	void SendHttp(Response& w);
 
-	// Send a websocket frame. This can be called from multiple threads.
+	// Send a websocket frame. This can be called from multiple threads, but only one thread
+	// may send on one particular websocket at a time.
 	// Returns false if the WebSocket channel has been closed
 	bool SendWebSocket(int64_t connectionID, RequestType type, const void* buf, size_t len);
 	bool SendWebSocket(int64_t connectionID, RequestType type, const std::string& buf);
@@ -390,13 +391,18 @@ private:
 	struct ConnectionSendSanity {
 		Connection* C = nullptr;
 		bool        Enter(Connection* c, const char* typeOfSend);
+		void        Exit(); // can be used to exit early, prior to destructor
 		~ConnectionSendSanity();
 	};
 
 	typedef std::shared_ptr<Connection> ConnectionPtr;
 
-	socket_t ListenSock = InvalidSocket;
-	int      ClosePipe[2]; // Used on linux to wake poll()
+	socket_t          ListenSock = InvalidSocket;
+	int               WakePipe[2];  // Used to wake poll()
+	std::atomic<bool> WakeSignaled; // Used to prevent too many writes into WakePipe
+
+	// This is used to adjust whether our poll loop is fast or slow. See big comment above Recv()
+	std::atomic<int64_t> FastTick;
 
 	std::mutex                                  ConnectionsLock; // Guards Connections, Sock2Connection, ID2Connection
 	std::vector<ConnectionPtr>                  Connections;
@@ -417,6 +423,7 @@ private:
 	void          CloseConnection(ConnectionPtr c);
 	void          CloseConnectionByID(int64_t id);
 	void          ResetForAnotherHttpRequest(ConnectionPtr c);
+	void          WakePoll();
 	// Generally, if a function returns false, then we must close the socket
 	bool ReadFromConnection(Connection* c, RequestPtr& r);
 	bool ReadFromWebSocket(Connection* c, RequestPtr& r);
@@ -427,6 +434,7 @@ private:
 	bool UpgradeToWebSocket(Response& w, Connection* c);
 	void ReadWebSocketBody(Connection* c);
 	bool SendHttpInternal(Response& w);
+	bool TransmitWebSocket(bool ensureSingleCaller, int64_t connectionID, RequestType type, const void* buf, size_t len);
 	bool SendBytes(Connection* c, const void* buf, size_t len);
 	bool SendBytes(Connection* c, std::vector<OutBuf> buffers);
 	bool SendWebSocketPong(Connection* c);
