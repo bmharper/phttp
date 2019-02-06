@@ -170,6 +170,9 @@ public:
 	Request(phttp::Server* server, int64_t connectionID, RequestType type);
 	~Request();
 
+	// Helper function to create a mocked request, for use in unit tests
+	static std::shared_ptr<Request> MockRequest(const std::string& method, const std::string& path, std::initializer_list<std::pair<std::string, std::string>> queryParams = {}, const std::string& body = "");
+
 	std::string        Header(const char* h) const;                                         // Returns first header found, or empty string. Header name match is case-insensitive
 	std::string        QueryVal(const char* key) const;                                     // Returns first value found, or empty string
 	int                QueryInt(const char* key) const;                                     // Returns first value found, or zero
@@ -221,11 +224,13 @@ public:
 	static Response MakeMultiHead(RequestPtr request);
 	static Response MakeMultiBody(RequestPtr request, const void* buf, size_t len);
 
-	size_t FindHeader(const std::string& header) const; // Returns the index of the first named header, or -1 if not found. Search is case-insensitive
-	void   SetHeader(const std::string& header, const std::string& val);
-	void   SetStatus(int status);
-	void   SetStatusAndBody(int status, const std::string& body);
-	void   Send(); // A convenience function that calls Request->Server->SendHttp(*this);
+	size_t      FindHeader(const std::string& header) const; // Returns the index of the first named header, or -1 if not found. Search is case-insensitive
+	std::string GetHeader(const std::string& header) const;  // Returns the value of the first named header, or an empty string if not found. Search is case-insensitive
+	void        SetHeader(const std::string& header, const std::string& val);
+	void        SetStatus(int status);
+	void        SetStatusAndBody(int status, const std::string& body);
+	void        SetStatusAndBody(int status, const void* body, size_t len);
+	void        Send(); // A convenience function that calls Request->Server->SendHttp(*this);
 };
 
 // Logger interface
@@ -312,6 +317,11 @@ public:
 	// Intended to be called from signal handlers, or another thread.
 	// This sets StopSignal to true, and closes the listening socket
 	void Stop();
+
+	// Call this after you've stopped the server with Stop(). This will close all sockets, and free all memory buffers.
+	// It is not necessary to call Cleanup() when using ListenAndRun().
+	// It is only necessary to call Cleanup() when using Listen().
+	void Cleanup();
 
 	// Wait for the next incoming message(s).
 	// This must only be called from a single thread, which is typically the same thread that called Listen().
@@ -417,7 +427,6 @@ private:
 	uint8_t* RecvBufEnd   = nullptr; // One past last byte in buffer. Amount of data in Buf is BufEnd - BufStart.
 	uint8_t* RecvBuf      = nullptr; // Buffer that is used for incoming data. Reset after every recv().
 
-	void          Cleanup();
 	void          AcceptOrReject();
 	ConnectionPtr ConnectionFromID(int64_t id);
 	void          CloseConnection(ConnectionPtr c);

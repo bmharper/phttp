@@ -49,7 +49,7 @@ static size_t WriteV(Server::socket_t sock, const std::vector<Server::OutBuf>& b
 	for (auto b : buffers) {
 		WSABUF w;
 		w.buf = (char*) b.Buf;
-		w.len = b.Len;
+		w.len = (ULONG) b.Len;
 		bufs.push_back(w);
 	}
 	DWORD bytesSent = 0;
@@ -256,6 +256,17 @@ Request::~Request() {
 	delete UserData;
 }
 
+std::shared_ptr<Request> Request::MockRequest(const std::string& method, const std::string& path, std::initializer_list<std::pair<std::string, std::string>> queryParams, const std::string& body) {
+	auto r              = make_shared<Request>(nullptr, 0, RequestType::Http);
+	r->Version          = "HTTP/1.1";
+	r->Path             = path;
+	r->Query            = queryParams;
+	r->Body             = body;
+	r->HttpBodyFinished = true;
+	r->BodyWritten      = body.size();
+	return r;
+}
+
 std::string Request::Header(const char* h) const {
 	for (const auto& p : Headers) {
 		if (EqualsNoCase(p.first.c_str(), h))
@@ -404,6 +415,13 @@ size_t Response::FindHeader(const std::string& header) const {
 	return -1;
 }
 
+std::string Response::GetHeader(const std::string& header) const {
+	size_t i = FindHeader(header);
+	if (i == -1)
+		return "";
+	return Headers[i].second;
+}
+
 void Response::SetHeader(const std::string& header, const std::string& val) {
 	size_t i = FindHeader(header);
 	if (i != -1)
@@ -419,6 +437,11 @@ void Response::SetStatus(int status) {
 void Response::SetStatusAndBody(int status, const std::string& body) {
 	Status = status;
 	Body   = body;
+}
+
+void Response::SetStatusAndBody(int status, const void* body, size_t len) {
+	Status = status;
+	Body.assign((const char*) body, len);
 }
 
 void Response::Send() {
