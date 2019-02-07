@@ -138,54 +138,54 @@ int main(int argc, char** argv) {
 		}
 	});
 
-	auto handler = [&server, &wsID](phttp::Response& w, phttp::Request& r) {
-		if (r.IsWebSocketUpgrade()) {
+	auto handler = [&server, &wsID](phttp::Response& w, phttp::RequestPtr r) {
+		if (r->IsWebSocketUpgrade()) {
 			// Before deciding to return OK, you must validate the Origin header for CORS sake.
 			// To upgrade the connection, send a 200, and populate the Sec-WebSocket-Protocol header,
 			// making it one of the proposed protocols that the client requested.
 			w.Status = 200;
 			// assume client proposed only one protocol, and if so, reply that we're accepting it
-			if (r.Header("Sec-WebSocket-Protocol") != "")
-				w.SetHeader("Sec-WebSocket-Protocol", r.Header("Sec-WebSocket-Protocol"));
-			wsID = r.ConnectionID;
+			if (r->Header("Sec-WebSocket-Protocol") != "")
+				w.SetHeader("Sec-WebSocket-Protocol", r->Header("Sec-WebSocket-Protocol"));
+			wsID = r->ConnectionID;
 			return;
 		}
 
-		if (r.Type == phttp::RequestType::Http) {
-			if (r.Path == "/") {
+		if (r->Type == phttp::RequestType::Http) {
+			if (r->Path == "/") {
 				w.SetHeader("Content-Type", "text/html; charset=utf-8");
 				w.SetHeader("Content-Encoding", "utf-8");
 				w.Body = "<!DOCTYPE HTML>\n<head><link rel='stylesheet' href='a.css'></head>\n<body>Hello phttp!</body>\n";
 				w.Body += "<script>";
 				w.Body += Script;
 				w.Body += "</script>";
-			} else if (r.Path == "/a.css") {
+			} else if (r->Path == "/a.css") {
 				w.SetHeader("Content-Type", "text/css");
 				w.Body = "body { color: #0a0 }";
-			} else if (r.Path == "/heavy") {
+			} else if (r->Path == "/heavy") {
 				// Send 32 MB payload
 				w.SetHeader("Content-Type", "text/plain");
 				w.Body = "12345678901234567890123456789012"; // 32 bytes
 				for (int i = 0; i < 20; i++)
 					w.Body += w.Body;
-			} else if (r.Path == "/seppuku") {
-				w.Body += "Stopping server. The client may never receive this message\n";
+			} else if (r->Path == "/seppuku") {
+				w.Body += "Stopping server-> The client may never receive this message\n";
 				server.Stop();
 			} else {
-				w.Body += "Unknown path: " + r.Path + "\n";
+				w.Body += "Unknown path: " + r->Path + "\n";
 				w.Body += "Query:\n";
-				for (auto p : r.Query)
+				for (auto p : r->Query)
 					w.Body += "" + p.first + ":" + p.second + "\n";
 			}
-		} else if (r.Type == phttp::RequestType::WebSocketClose) {
+		} else if (r->Type == phttp::RequestType::WebSocketClose) {
 			printf("websocket closed by client\n");
 			wsID = 0;
-		} else if (r.Type == phttp::RequestType::WebSocketText) {
+		} else if (r->Type == phttp::RequestType::WebSocketText) {
 			// This demonstrates sending a reply to a websocket frame.
 			// WebSockets are not typically used in a request/response manner,
 			// but for the purposes of demonstration, we do that here.
-			printf("websocket in: %s\n", r.Frame().c_str());
-			server.SendWebSocket(r.ConnectionID, phttp::RequestType::WebSocketText, "hi from websocket!");
+			printf("websocket in: %s\n", r->Frame().c_str());
+			server.SendWebSocket(r->ConnectionID, phttp::RequestType::WebSocketText, "hi from websocket!");
 		}
 	};
 

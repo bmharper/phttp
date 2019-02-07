@@ -538,15 +538,15 @@ Server::Server() {
 	memset(WakePipe, 0, sizeof(WakePipe));
 }
 
-bool Server::ListenAndRun(const char* bindAddress, int port, std::function<void(Response& w, Request& r)> handler) {
+bool Server::ListenAndRun(const char* bindAddress, int port, std::function<void(Response& w, RequestPtr r)> handler) {
 	if (!Listen(bindAddress, port))
 		return false;
 	while (!StopSignal) {
 		vector<RequestPtr> requests = Recv();
 		for (auto r : requests) {
 			Response w(r);
-			handler(w, *r);
-			if (r->Type == RequestType::Http)
+			handler(w, r);
+			if (r->Type == RequestType::Http && (w.Body != "" || w.Status != 0))
 				SendHttp(w);
 		}
 	}

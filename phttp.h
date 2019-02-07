@@ -306,9 +306,7 @@ public:
 	Server();
 
 	// Listen and Recv until we get the stop signal.
-	// This is the simplest way of using phttp, but it is limited,
-	// because you can only process a single request as a time.
-	bool ListenAndRun(const char* bindAddress, int port, std::function<void(Response& w, Request& r)> handler);
+	bool ListenAndRun(const char* bindAddress, int port, std::function<void(Response& w, RequestPtr r)> handler);
 
 	// Start listening. Use in combination with Recv() to process incoming messages.
 	// Returns false if unable to bind to the address:port
