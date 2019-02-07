@@ -2,15 +2,15 @@
 
 phttp is a small HTTP/1.1 embeddable C++11 server library that aims to be correct and robust, but very low on features. phttp listens for network traffic from a single thread, but multiple threads can write responses.
 
-* Run on Linux (Clang/GCC)
-* Run on Windows (MSVC)
-* Uses `poll`, so it doesn't scale beyond a thousand or so connections
-* Uses non-blocking IO, which allows you to detect and throttle back the transmission of large responses
+* Runs on Linux (Clang/GCC)
+* Runs on Windows (MSVC)
 * Supports WebSockets
+* Does not spawn any threads itself, but you are free to use as many threads as you need to serve your responses
+* Uses non-blocking IO, which allows you to detect and throttle back the transmission of large responses
 * Exposes an interface to provide transparent gzip/deflate compression to outgoing responses
 * Logs can be written to your own logging interface
-* Does not spawn any threads itself, but you are free to use as many threads as you need to serve your responses
 * Uses the machine-generated HTTP header parser by Zed Shaw, which has never had a security vulnerability
+* Uses `poll`, so it doesn't scale beyond a thousand or so connections
 * No support for TSL/SSL
 
 A simple server:
