@@ -74,8 +74,12 @@ static size_t WriteV(Server::socket_t sock, const std::vector<Server::OutBuf>& b
 		v.iov_len  = b.Len;
 		bufs.push_back(v);
 	}
-	ssize_t res = writev(sock, &bufs[0], (int) bufs.size());
-	if (res == -1 && errno == EWOULDBLOCK)
+	struct msghdr msg;
+	memset(&msg, 0, sizeof(msg));
+	msg.msg_iov    = &bufs[0];
+	msg.msg_iovlen = bufs.size();
+	ssize_t res    = sendmsg(sock, &msg, MSG_NOSIGNAL);
+	if (res == -1 && (errno == EWOULDBLOCK || errno == EAGAIN))
 		return 0;
 	if (res >= 0)
 		return res;
@@ -799,6 +803,13 @@ void Server::AcceptOrReject() {
 		closesocket(newSock);
 		return;
 	}
+
+	// For linux, we use MSG_NOSIGNAL whenever we issue a send()
+#ifdef __APPLE__
+	assert(false); // The code block inside this #ifdef has never been tested!
+	int noSigPipe = 1;
+	setsockopt(newSock, SOL_SOCKET, SO_NOSIGPIPE, &noSigPipe, sizeof(noSigPipe));
+#endif
 
 	// Always enable NODELAY on our connections. We leave it up to the user to buffer up his
 	// writes, so that they're sufficiently large. We make sure that we buffer up where we can.
