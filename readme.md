@@ -48,7 +48,7 @@ On Windows, open a `Visual Studio Command Prompt`. You must have WSL and Go inst
 
 On Linux
 
-	make -s -j build/server.exe && go run tests/test.go
+	make -s -j build/server && go run tests/test.go
 
 ## Scalability
 The use of `poll` introduces a hard O(N) factor every time we ask the OS for more data, where N is the number
