@@ -1254,7 +1254,7 @@ bool Server::SendHttpInternal(Response& w) {
 			keepAlive = false;
 	}
 
-	if (Compressor && isSimple && w.FindHeader("Content-Length") == -1 && w.FindHeader("Content-Encoding") == -1) {
+	if (Compressor && isSimple && w.Body.size() > 40 && w.FindHeader("Content-Length") == -1 && w.FindHeader("Content-Encoding") == -1) {
 		void*  cbuf = nullptr;
 		size_t clen = 0;
 		string responseEncoding;
