@@ -537,8 +537,10 @@ Server::ConnectionSendSanity::~ConnectionSendSanity() {
 }
 
 Server::Server() {
-	NextReqID = 1;
-	FastTick  = 0;
+	StopSignal   = false;
+	NextReqID    = 1;
+	FastTick     = 0;
+	WakeSignaled = false;
 	memset(WakePipe, 0, sizeof(WakePipe));
 }
 
