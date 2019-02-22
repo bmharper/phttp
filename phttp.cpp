@@ -1584,7 +1584,7 @@ bool Server::SendBytes(Connection* c, std::vector<OutBuf> buffers) {
 	} else {
 		// OutQueue is done (or was initially empty), so add the remaining chunks into OutQueue
 		c->OutQueue.clear();
-		ssize_t n = (ssize_t) written;
+		size_t n = written;
 		for (size_t i = 0; i < buffers.size(); i++) {
 			if (n >= buffers[i].Len) {
 				// this buffer was written completely
