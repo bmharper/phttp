@@ -1578,20 +1578,33 @@ bool Server::SendBytes(Connection* c, std::vector<OutBuf> buffers) {
 	if (written < c->OutQueue.size()) {
 		// we didn't even get through OutQueue
 		c->OutQueue.erase(0, written);
+		// add all of the buffers to OutQueue (OutQueue is buffer[0], so we skip it)
+		for (size_t i = 1; i < buffers.size(); i++)
+			c->OutQueue.append((const char*) buffers[i].Buf, buffers[i].Len);
+	} else {
+		// OutQueue is done (or was initially empty), so add the remaining chunks into OutQueue
+		c->OutQueue.clear();
+		ssize_t n = (ssize_t) written;
+		for (size_t i = 0; i < buffers.size(); i++) {
+			if (n >= buffers[i].Len) {
+				// this buffer was written completely
+				n -= buffers[i].Len;
+			} else {
+				// this buffer was only partially written (or not at all, in the case where n = 0)
+				c->OutQueue.append((const char*) buffers[i].Buf + n, buffers[i].Len - n);
+				n = 0;
+			}
+		}
 	}
 
-	// add all of the buffers to OutQueue
-	size_t i = orgOutQueueSize == 0 ? 0 : 1;
-	for (; i < buffers.size(); i++)
-		c->OutQueue.append((const char*) buffers[i].Buf, buffers[i].Len);
-
+	assert(c->OutQueue.size() != 0);
 	c->OutQueueHasData = c->OutQueue.size() != 0;
 
 	if (orgOutQueueSize == 0 && c->OutQueue.size() != 0) {
 		// We have entered a state where we need to wait for the OS to tell us when the TCP buffer
 		// has capacity, so that we can once again write to it. It's very likely that we're busy
 		// right now, on another thread, in a call to poll(), and that this socket is only being
-		// monitored for POLLIN. After we call poll() loop wakes up, it will notice that
+		// monitored for POLLIN. After the that poll() loop wakes up, it will notice that
 		// OutQueueHasData == true for this socket, and it will then listen not just for POLLIN,
 		// but also for POLLOUT.
 		WakePoll();
