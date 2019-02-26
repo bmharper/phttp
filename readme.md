@@ -35,11 +35,6 @@ elsewhere.
 On Windows, before running a server, you must call `phttp::Initialize()`. This is just a
 wrapper around `WSAStartup()`.
 
-## Threading Model
-All socket _input_ is performed from a single thread, via the `Recv()` function. This function uses `poll` to
-determine which sockets are ready to be read/written.
-Socket output can be performed from any thread.
-
 ## Testing
 
 On Windows, open a `Visual Studio Command Prompt`. You must have WSL and Go installed.
@@ -57,6 +52,76 @@ of TCP sockets that we have open. On Linux, one could change this code to use `e
 Windows does not support anything like `epoll`, so one would need to switch to IOCP. This would require
 a non-trivial amount of code, but it might be possible to do it without introducing too much platform-specific switches etc.
 However, not a lot of people are writing server-side C++ code on Windows these days, so there's probably not much call for this.
+
+## Threading Model
+All socket _input_ is performed from a single thread, via the `Recv()` function. This function uses `poll` to
+determine which sockets are ready to be read/written.
+Socket output can be performed from any thread.
+
+Note that there are some subtleties that come into play if you decide to process HTTP requests from multiple
+threads. The following sample demonstrates how to correctly handle requests from multiple threads.
+
+```cpp
+
+// 'queue' in this example is some kind of thread-safe queue
+
+phttp::Server server;
+
+auto httpThreadFunc = [&]() {
+	while (!server.StopSignal) {
+		auto request = queue->popTail();
+		if (!request) {
+			// a null request means we must quit
+			break;
+		}
+
+		// Make sure that we are the one and only thread taking ownership of this request
+		bool expect = false;
+		if (!request->HasHandler.compare_exchange_strong(expect, true)) {
+			// another thread has already started handling this request
+			continue;
+		}
+
+		phttp::Response w(request);
+		w.Body = "Hello!";
+		w.Send();
+	}
+};
+
+// launch 3 handler threads
+vector<thread> handlers;
+for (int i = 0; i < 3; i++)
+	handlers.push_back(thread(httpThreadFunc));
+
+if (!server.Listen("127.0.0.1", 8080)) {
+	printf("Failed to bind to port 8080\n");
+	return;
+}
+
+while (!server.StopSignal) {
+	auto requests = server.Recv();
+	for (auto request : requests) {
+		if (!request->IsHttpBodyFinished()) {
+			// Ignore this request, because the client is still busy transmitting the body.
+			// If we were handling a large file upload, then we would be doing something here,
+			// such as writing the bytes to disk, as they arrive.
+			// Request::ReadBody() is built for this purpose, allowing you to remove the bytes
+			// as they arrive.
+			continue;
+		}
+		// One of the handler threads will take care of this request
+		requestQueue.pushHead(request);
+	}
+}
+
+// signal the handler threads to quit
+for (size_t i = 0; i < handlers.size(); i++)
+	requestQueue.pushHead(nullptr);
+
+// clean up the threads
+for (size_t i = 0; i < handlers.size(); i++)
+	handlers[i].join();
+```
 
 ## Attribution
 

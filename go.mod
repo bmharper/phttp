@@ -1,3 +1,3 @@
-module "github.com/bmharper/phttp"
+module github.com/bmharper/phttp
 
-require "github.com/gorilla/websocket" v1.2.0
+require github.com/gorilla/websocket v1.2.0

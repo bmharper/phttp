@@ -254,6 +254,7 @@ static void Base64Encode(const uint8_t* raw, size_t len, char* enc) {
 }
 
 Request::Request(phttp::Server* server, int64_t connectionID, RequestType type) : Server(server), ConnectionID(connectionID), Type(type) {
+	HasHandler = false;
 }
 
 Request::~Request() {
@@ -1746,8 +1747,10 @@ void Server::CloseConnection(ConnectionPtr c) {
 		Sock2Connection.erase(c->Sock);
 		ID2Connection.erase(c->ID);
 		Connections.erase(Connections.begin() + i);
-		c->Request = nullptr;
-		c->State   = ConnectionState::Closed;
+		// You might think it's good to set c->Request = nullptr here, but that is not correct, because other threads
+		// can still be busy trying to do something with c->Request. This was first noticed from inside
+		// SendHttpInternal(), which was reading c->Request->Version, and c->Request was null.
+		c->State = ConnectionState::Closed;
 	}
 	if (LogAllEvents)
 		WriteLog("[%5lld %5d] socket closed", (long long) c->ID, (int) c->Sock);
