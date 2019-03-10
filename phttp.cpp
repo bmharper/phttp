@@ -34,6 +34,7 @@ namespace phttp {
 static const uint32_t Infinite        = INFINITE;
 static const int      ErrSOCKET_ERROR = SOCKET_ERROR;
 typedef LONG          nfds_t;
+typedef SSIZE_T       ssize_t;
 
 int poll(_Inout_ LPWSAPOLLFD fdArray, _In_ ULONG fds, _In_ INT timeout) {
 	return WSAPoll(fdArray, fds, timeout);
@@ -1587,7 +1588,7 @@ bool Server::SendBytes(Connection* c, std::vector<OutBuf> buffers) {
 		c->OutQueue.clear();
 		size_t n = written;
 		for (size_t i = 0; i < buffers.size(); i++) {
-			if (n >= buffers[i].Len) {
+			if (n >= (ssize_t) buffers[i].Len) {
 				// this buffer was written completely
 				n -= buffers[i].Len;
 			} else {
