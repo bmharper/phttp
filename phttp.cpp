@@ -412,6 +412,12 @@ Response Response::MakeMultiBody(RequestPtr request, const void* buf, size_t len
 	return r;
 }
 
+void Response::Reset() {
+	Status = 0;
+	Headers.clear();
+	Body.clear();
+}
+
 size_t Response::FindHeader(const std::string& header) const {
 	for (size_t i = 0; i < Headers.size(); i++) {
 		if (EqualsNoCase(Headers[i].first.c_str(), header.c_str()))

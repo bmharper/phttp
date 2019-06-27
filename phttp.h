@@ -225,6 +225,7 @@ public:
 	static Response MakeMultiHead(RequestPtr request);
 	static Response MakeMultiBody(RequestPtr request, const void* buf, size_t len);
 
+	void        Reset();                                     // Reset all fields except for Type and Request.
 	size_t      FindHeader(const std::string& header) const; // Returns the index of the first named header, or -1 if not found. Search is case-insensitive
 	std::string GetHeader(const std::string& header) const;  // Returns the value of the first named header, or an empty string if not found. Search is case-insensitive
 	void        SetHeader(const std::string& header, const std::string& val);
