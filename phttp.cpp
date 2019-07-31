@@ -321,7 +321,7 @@ size_t Request::ReadBody(size_t start, void* dst, size_t maxLen, bool clear) {
 		return 0;
 	memcpy(dst, Body.data() + start, maxLen);
 	if (clear)
-		memmove((char*) Body.data() + start, Body.data() + start + maxLen, Body.size() - (start + maxLen));
+		Body.erase(Body.begin() + start, Body.begin() + start + maxLen);
 	return maxLen;
 }
 
@@ -334,7 +334,7 @@ size_t Request::ReadBody(size_t start, std::string& dst, size_t maxLen, bool cle
 		return 0;
 	dst.append(Body.data() + start, maxLen);
 	if (clear)
-		memmove((char*) Body.data() + start, Body.data() + start + maxLen, Body.size() - (start + maxLen));
+		Body.erase(Body.begin() + start, Body.begin() + start + maxLen);
 	return maxLen;
 }
 
@@ -1079,7 +1079,7 @@ bool Server::ReadFromHttpRequest(Connection* c, RequestPtr& r) {
 	// The server will wait for a response before sending another request.
 	// WebSockets are full duplex, which is why their implementation is more complex.
 
-	// It is normal for IsHttpHeaderDone to be true now, even through it was false in the above block
+	// It is normal for IsHttpHeaderDone to be true now, even though it was false in the above block
 
 	if (!wasHttpHeaderDone && c->IsHttpHeaderDone) {
 		// HTTP request is ready to be consumed
