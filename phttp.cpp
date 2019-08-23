@@ -255,6 +255,7 @@ static void Base64Encode(const uint8_t* raw, size_t len, char* enc) {
 
 Request::Request(phttp::Server* server, int64_t connectionID, RequestType type) : Server(server), ConnectionID(connectionID), Type(type) {
 	HasHandler = false;
+	UserData   = nullptr;
 }
 
 Request::~Request() {

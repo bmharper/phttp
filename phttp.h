@@ -151,22 +151,22 @@ class PHTTP_API Request {
 public:
 	typedef std::vector<std::pair<std::string, std::string>> StrPairList;
 
-	phttp::Server*    Server        = nullptr;
-	RequestType       Type          = RequestType::Null;
-	size_t            ContentLength = 0;     // Parsed from the Content-Length header
-	int64_t           ConnectionID  = 0;     // ID of the socket connection (but not literally the socket fd).
-	bool              IsChunked     = false; // True if this is a chunked request
-	std::string       Version;               // "HTTP/1.0" or "HTTP/1.1"
-	StrPairList       Headers;               // Headers
-	std::string       Method;                // Method (GET,POST,DELETE,etc)
-	std::string       URI;                   // URI
-	std::string       RawPath;               // Path before performing URL unescaping
-	std::string       Path;                  // Path with URL unescaping (ie %20 -> char(32))
-	std::string       Fragment;              // The portion of the URL after the first #
-	std::string       RawQuery;              // The portion of the URL after the first ?
-	StrPairList       Query;                 // Parsed key+value pairs from RawQuery
-	RequestUserData*  UserData = nullptr;    // User data that an HTTP service can attach to a request. Deleted when Request is destroyed
-	std::atomic<bool> HasHandler;            // Intended for user code to prevent two threads from handling the same request
+	phttp::Server*                Server        = nullptr;
+	RequestType                   Type          = RequestType::Null;
+	size_t                        ContentLength = 0;     // Parsed from the Content-Length header
+	int64_t                       ConnectionID  = 0;     // ID of the socket connection (but not literally the socket fd).
+	bool                          IsChunked     = false; // True if this is a chunked request
+	std::string                   Version;               // "HTTP/1.0" or "HTTP/1.1"
+	StrPairList                   Headers;               // Headers
+	std::string                   Method;                // Method (GET,POST,DELETE,etc)
+	std::string                   URI;                   // URI
+	std::string                   RawPath;               // Path before performing URL unescaping
+	std::string                   Path;                  // Path with URL unescaping (ie %20 -> char(32))
+	std::string                   Fragment;              // The portion of the URL after the first #
+	std::string                   RawQuery;              // The portion of the URL after the first ?
+	StrPairList                   Query;                 // Parsed key+value pairs from RawQuery
+	std::atomic<RequestUserData*> UserData;              // User data that an HTTP service can attach to a request. Deleted when Request is destroyed
+	std::atomic<bool>             HasHandler;            // Intended for user code to prevent two threads from handling the same request
 
 	Request(phttp::Server* server, int64_t connectionID, RequestType type);
 	~Request();
