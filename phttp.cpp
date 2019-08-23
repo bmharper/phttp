@@ -259,7 +259,9 @@ Request::Request(phttp::Server* server, int64_t connectionID, RequestType type) 
 }
 
 Request::~Request() {
-	delete UserData;
+	// We need a temporary copy to satisfy clang
+	RequestUserData* ud = UserData;
+	delete ud;
 }
 
 std::shared_ptr<Request> Request::MockRequest(const std::string& method, const std::string& path, std::initializer_list<std::pair<std::string, std::string>> queryParams, const std::string& body) {
