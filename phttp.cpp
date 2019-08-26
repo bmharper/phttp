@@ -509,7 +509,8 @@ void FileLogger::Log(const char* msg) {
 }
 
 Server::Connection::Connection(Server* owner) {
-	State               = ConnectionState::HttpRecv;
+	State               = ConnectionState::HttpSendRecv;
+	CanRecv             = true;
 	OutQueueHasData     = false;
 	CloseWhenQueueEmpty = false;
 	IsSendBusy          = false;
@@ -773,7 +774,7 @@ std::vector<RequestPtr> Server::Recv() {
 					if (!c->OutQueueHasData && c->CloseWhenQueueEmpty)
 						CloseConnection(c);
 				}
-				if (canRead && (c->State == ConnectionState::HttpRecv || c->State == ConnectionState::WebSocket)) {
+				if (canRead && ((c->State == ConnectionState::HttpSendRecv && c->CanRecv) || c->State == ConnectionState::WebSocket)) {
 					RequestPtr r;
 					if (!ReadFromConnection(c.get(), r)) {
 						if (isWebSocket)
@@ -852,11 +853,11 @@ void Server::AcceptOrReject() {
 }
 
 bool Server::ReadFromConnection(Connection* c, RequestPtr& r) {
-	if (c->State == ConnectionState::HttpSend) {
+	if (!c->CanRecv) {
 		// We are not ready to receive a request. This is illegal (it is actually HTTP 1.1 "pipelining", but that never
 		// came into use, and was replaced by HTTP/2).
 		if (LogAllEvents)
-			WriteLog("[%5lld %5d] socket recv while in HttpSend state", (long long) c->ID, (int) c->Sock);
+			WriteLog("[%5lld %5d] socket recv while c->CanRecv = false", (long long) c->ID, (int) c->Sock);
 		return false;
 	}
 
@@ -1062,6 +1063,7 @@ void Server::ReadWebSocketBody(Connection* c) {
 bool Server::ReadFromHttpRequest(Connection* c, RequestPtr& r) {
 	auto parser            = &c->Parser;
 	bool wasHttpHeaderDone = c->IsHttpHeaderDone;
+	bool wasBodyFinished   = c->Request->IsHttpBodyFinished();
 	if (!c->IsHttpHeaderDone) {
 		c->HttpHeadBuf.append((const char*) RecvBufStart, RecvBufLen());
 		size_t oldPos = parser->nread;
@@ -1104,12 +1106,32 @@ bool Server::ReadFromHttpRequest(Connection* c, RequestPtr& r) {
 		}
 
 		r = c->Request;
-		if (c->Request->IsHttpBodyFinished())
-			c->State = ConnectionState::HttpSend;
+		if (c->Request->IsHttpBodyFinished() && !wasBodyFinished) {
+			c->CanRecv = false;
+		}
 	}
 
 	return true;
 }
+// Example from https://en.wikipedia.org/wiki/Chunked_transfer_encoding
+//
+// 4\r\n
+// Wiki\r\n
+// 5\r\n
+// pedia\r\n
+// 0\r\n
+// \r\n
+//
+// And this is out interpretation of that:
+// Chunk 0 Header:  4\r\n
+// Chunk 0 Data:    Wiki
+// Chunk 0 End:     \r\n
+// Chunk 1 Header:  5\r\n
+// Chunk 1 Data:    pedia
+// Chunk 1 End:     \r\n
+// Chunk 2 Header:  0\r\n
+// Chunk 2 Data:
+// Chunk 2 End:     \r\n
 
 bool Server::ReadHttpChunkedBody(Connection* c, const void* _buf, size_t _len) {
 	// As we consume '_buf', we increment 'buf', and decrement 'len'
@@ -1122,14 +1144,24 @@ bool Server::ReadHttpChunkedBody(Connection* c, const void* _buf, size_t _len) {
 			uint32_t chunkSize = 0;
 			if (!ParseChunkHead(c, c->ChunkHead.c_str(), c->ChunkHead.size(), chunkSize))
 				return false;
-			size_t maxRead = min(len, chunkSize - c->ChunkReceived);
-			c->Request->WriteHttpBody(buf, maxRead, chunkSize == 0);
+			size_t maxRead = min(len, chunkSize - c->ChunkBodyReceived);
+			c->Request->WriteHttpBody(buf, maxRead, false);
 			buf += maxRead;
 			len -= maxRead;
-			c->ChunkReceived += maxRead;
-			if (c->ChunkReceived == chunkSize) {
+			c->ChunkBodyReceived += maxRead;
+			if (len != 0 && c->ChunkBodyReceived == chunkSize) {
+				// read the final 2 bytes of \r\n of this chunk
+				size_t consume = min(len, 2 - c->ChunkEndReceived);
+				c->ChunkEndReceived += consume;
+				buf += consume;
+				len -= consume;
+			}
+			if (c->ChunkEndReceived == 2) {
 				// reset for next chunk (this path is also triggered when we receive the final chunk)
-				c->ChunkReceived = 0;
+				if (chunkSize == 0)
+					c->Request->WriteHttpBody(nullptr, 0, true);
+				c->ChunkBodyReceived = 0;
+				c->ChunkEndReceived  = 0;
 				c->ChunkHead.clear();
 			}
 		} else {
@@ -1232,8 +1264,8 @@ bool Server::SendHttpInternal(Response& w) {
 	if (!sanity.Enter(c.get(), "HTTP"))
 		return false;
 
-	if (c->State != ConnectionState::HttpSend) {
-		WriteLog("[%5lld] Attempt to send HTTP response when state is %d", (int) c->State.load(), (long long) w.Request->ConnectionID);
+	if (c->State != ConnectionState::HttpSendRecv) {
+		WriteLog("[%5lld] Attempt to send HTTP response when state is %d", (long long) w.Request->ConnectionID, (int) c->State.load());
 		return false;
 	}
 
@@ -1264,6 +1296,18 @@ bool Server::SendHttpInternal(Response& w) {
 		auto ch = c->Request->Header("Connection");
 		if (ch.find("Keep-Alive") == -1 && ch.find("keep-alive") == -1)
 			keepAlive = false;
+	}
+
+	if (!w.Request->IsHttpBodyFinished()) {
+		// This is an early response, such as one sent by an upload system, where the authentication has
+		// failed, and the server is trying to tell the client "stop uploading, I'm going to throw your data away anyway".
+		// This is not a normal case, and there's not much we can do here, except for send a response, and then close
+		// the socket. Trying to keep the socket alive would add complexity, because we'd then need to place the socket
+		// in this limbo state, where we wait for the client to finish uploading, and THEN reset the socket. On the other
+		// hand, if the client respects this message, then how would we know that the client has cancelled it's upload?
+		// The answer is that there is no way for a client to communicate this. So killing the socket is the only
+		// reasonable thing to do.
+		keepAlive = false;
 	}
 
 	if (Compressor && isSimple && w.Body.size() > 40 && w.FindHeader("Content-Length") == -1 && w.FindHeader("Content-Encoding") == -1) {
@@ -1348,13 +1392,15 @@ bool Server::SendHttpInternal(Response& w) {
 
 void Server::ResetForAnotherHttpRequest(ConnectionPtr c) {
 	auto oldID          = c->ID;
-	c->State            = ConnectionState::HttpRecv;
+	c->State            = ConnectionState::HttpSendRecv;
+	c->CanRecv          = true;
 	c->ID               = NextReqID++;
 	c->Request          = make_shared<Request>(this, c->ID, RequestType::Http);
 	c->IsHttpHeaderDone = false;
 	c->HttpHeadBuf.clear();
 	c->ChunkHead.clear();
-	c->ChunkReceived = 0;
+	c->ChunkBodyReceived = 0;
+	c->ChunkEndReceived  = 0;
 	// We do not clear c->OutQueue here, because there may still be data from the previous request that hasn't been written yet
 	phttp_parser_init(&c->Parser);
 	if (LogAllEvents)
@@ -1477,7 +1523,7 @@ size_t Server::SendCapacity(int64_t connectionID) {
 		return -1;
 	if (c->OutQueueHasData)
 		return 0;
-	if (c->State != ConnectionState::HttpSend)
+	if (c->State != ConnectionState::HttpSendRecv)
 		return -1;
 
 	// this value is total thumbsuck. I don't think it's simple to compute an optimal value for this.
@@ -1536,7 +1582,8 @@ bool Server::UpgradeToWebSocket(Response& w, Connection* c) {
 	if (!SendBytes(c, wbuf.c_str(), wbuf.size()))
 		return false;
 
-	c->State = ConnectionState::WebSocket;
+	c->State   = ConnectionState::WebSocket;
+	c->CanRecv = true;
 
 	if (LogAllEvents)
 		WriteLog("[%5lld %5d] upgraded to websocket", (long long) c->ID, (int) c->Sock);

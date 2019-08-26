@@ -35,20 +35,34 @@ const serverURL = "http://localhost:8080"
 const serverURL_WS = "ws://localhost:8080"
 const externalServer = false // Enable this when debugging C++ code
 const enableProfile = false
+const failedTest = "failed test"
+
+func ok(cx *context, err error) {
+	if err != nil {
+		dieMsgf("Unexpected error: %v\n", err)
+	}
+}
 
 type testFunc struct {
-	runMode string
-	f       func(cx *context)
+	nServerThreads int
+	f              func(cx *context)
 }
 
 func main() {
 	launch := func(tf testFunc) bool {
 		name := strings.Split(getFunctionName(tf.f), ".")[1]
 		fmt.Printf("%-20s ", name)
-		cx := newContext(tf.runMode)
+		cx := newContext(tf.nServerThreads)
 		defer func() bool {
 			cx.close()
 			if r := recover(); r != nil {
+				ignorePanic := false
+				if panicStr, ok := r.(string); ok {
+					ignorePanic = panicStr == failedTest
+				}
+				if !ignorePanic {
+					fmt.Printf("Recover from panic: %v\n", r)
+				}
 				return false
 			}
 			return true
@@ -74,12 +88,14 @@ func main() {
 	}
 
 	tests := []testFunc{
-		{"1", TestBasic},
-		{"1", TestMethods},
-		{"2", TestConcurrency},
-		{"2", TestWebSocketHello},
-		{"1", TestWebSocket},
-		{"2", TestBackoff},
+		{1, TestEarlyResponse},
+		{1, TestChunkedRecv},
+		{1, TestBasic},
+		{1, TestMethods},
+		{2, TestConcurrency},
+		{2, TestWebSocketHello},
+		{1, TestWebSocket},
+		{2, TestBackoff},
 	}
 
 	for _, t := range tests {
@@ -99,12 +115,12 @@ func die(err error) {
 
 func dieMsg(err string) {
 	fmt.Printf("Fatal: %v\n", err)
-	panic(true)
+	panic(failedTest)
 }
 
 func dieMsgf(format string, args ...interface{}) {
 	fmt.Printf(format+"\n", args...)
-	panic(true)
+	panic(failedTest)
 }
 
 func dumpHeaders(resp *http.Response) {
@@ -119,12 +135,12 @@ type context struct {
 	stdout io.ReadCloser
 }
 
-func newContext(runMode string) *context {
+func newContext(nServerThreads int) *context {
 	var err error
 	c := &context{}
 	if !externalServer {
 		c.server = exec.Command("build/server")
-		c.server.Args = append(c.server.Args, runMode)
+		c.server.Args = append(c.server.Args, strconv.Itoa(nServerThreads))
 		c.server.Stdout = os.Stdout
 		err = c.server.Start()
 		if err != nil {
@@ -465,5 +481,82 @@ func TestBackoff(cx *context) {
 		for i := 0; i < numReq; i++ {
 			<-done
 		}
+	}
+}
+
+type SlowReader struct {
+	buf            io.Reader
+	bytesPerSecond float64
+	timeStart      time.Time
+	bytesRead      int
+}
+
+func (s *SlowReader) Read(p []byte) (n int, err error) {
+	if s.timeStart.IsZero() {
+		s.timeStart = time.Now().Add(-time.Millisecond)
+	}
+	budget := time.Now().Sub(s.timeStart).Seconds() * s.bytesPerSecond
+	remain := int(budget) - s.bytesRead
+	if remain <= 0 {
+		return 0, nil
+	}
+	//fmt.Printf("%v: remain: %v\n", time.Now(), remain)
+	if remain < cap(p) {
+		remain = cap(p)
+	}
+	miniBuf := [5]byte{}
+	n, err = s.buf.Read(miniBuf[:])
+	copy(p, miniBuf[:n])
+	s.bytesRead += n
+	//fmt.Printf("%v: read: %v, total: %v\n", time.Now(), n, s.bytesRead)
+	//os.Exit(1)
+	return n, err
+}
+
+func TestChunkedRecv(cx *context) {
+	body := &bytes.Buffer{}
+	bodyStr := ""
+	for i := 0; i < 1; i++ {
+		msg := "one two three four five, once i caught a fish alive"
+		body.Write([]byte(msg))
+		bodyStr += msg
+	}
+	requestBodyReader := &SlowReader{
+		buf:            body,
+		bytesPerSecond: 50,
+	}
+
+	req, _ := http.NewRequest("POST", serverURL+"/chunked-recv", requestBodyReader)
+	resp, err := cx.client.Do(req)
+	ok(cx, err)
+	defer resp.Body.Close()
+	respBody, err := ioutil.ReadAll(resp.Body)
+	ok(cx, err)
+	if string(respBody) != bodyStr {
+		dieMsgf("Unexpected response: %v", respBody)
+	}
+}
+
+// Test the case where phttp responds to a request before the request body
+// has finished sending.
+func TestEarlyResponse(cx *context) {
+	body := &bytes.Buffer{}
+	for i := 0; i < 1; i++ {
+		body.Write([]byte("one two three four five, once i caught a fish alive"))
+	}
+	requestBodyReader := &SlowReader{
+		buf:            body,
+		bytesPerSecond: 30,
+	}
+
+	req, err := http.NewRequest("POST", serverURL+"/early-response", requestBodyReader)
+	ok(cx, err)
+	resp, err := cx.client.Do(req)
+	ok(cx, err)
+	if resp.StatusCode != 402 {
+		dieMsgf("Expected response of 402, but got %v", resp.StatusCode)
+	}
+	if resp != nil {
+		defer resp.Body.Close()
 	}
 }

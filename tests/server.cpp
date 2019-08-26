@@ -137,6 +137,7 @@ void ProcessWSFrame(ServerState* ss, phttp::RequestPtr r) {
 	} else {
 		ss->WSHistory[r->ConnectionID].push_back(val);
 		ss->WSLastRecv[r->ConnectionID] = val;
+		//printf("Received value %d on websocket id %d\n", val, (int) r->ConnectionID);
 	}
 }
 
@@ -254,6 +255,29 @@ void StreamThread(ServerState* ss, phttp::Server* s) {
 	}
 }
 
+void ChunkedRecv(ServerState* ss, phttp::RequestPtr r) {
+	if (r->IsHttpBodyFinished()) {
+		phttp::Response w(r);
+		w.SetStatusAndBody(200, *r->HttpBody());
+		w.Send();
+	}
+}
+
+void SendEarlyResponse(ServerState* ss, phttp::RequestPtr r) {
+	// Once we've received 20 bytes, send a response.
+	// The idea with this test, is that the body size is larger than 20, so we're sending a response
+	// before the request body has finished uploading.
+	if (r->BodyBytesReceived() >= 20) {
+		bool expect = false;
+		if (r->HasHandler.compare_exchange_strong(expect, true)) {
+			phttp::Response w(r);
+			w.SetStatusAndBody(402, "Not logged in");
+			w.Send();
+			return;
+		}
+	}
+}
+
 void ProcessingThread(ServerState* ss, phttp::Server* s) {
 	while (!s->StopSignal) {
 		auto r = ss->HttpQ.Pop();
@@ -300,6 +324,10 @@ void ProcessingThread(ServerState* ss, phttp::Server* s) {
 			w.Send();
 		} else if (r->Path == "/stream") {
 			ss->StreamQ.Push(r);
+		} else if (r->Path == "/early-response") {
+			SendEarlyResponse(ss, r);
+		} else if (r->Path == "/chunked-recv") {
+			ChunkedRecv(ss, r);
 		} else if (r->Path == "/kill") {
 			//printf("Received kill\n");
 			w.SetStatus(200);

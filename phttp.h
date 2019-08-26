@@ -356,8 +356,7 @@ public:
 private:
 	// The states that a Connection can be in
 	enum class ConnectionState {
-		HttpRecv,
-		HttpSend,
+		HttpSendRecv, // Receiving or sending HTTP. See also Connection::CanRecv, which is a sub-state of this.
 		WebSocket,
 		Shutdown,
 		Closed,
@@ -367,7 +366,8 @@ private:
 	struct Connection {
 		Server*                      Owner = nullptr;
 		std::atomic<ConnectionState> State;
-		socket_t                     Sock = InvalidSocket;
+		std::atomic<bool>            CanRecv;                  // True if we're still expecting to receive data on this connection.
+		socket_t                     Sock = InvalidSocket;     // The OS socket
 		int64_t                      ID   = 0;                 // ID of the channel (see Server class docs)
 		phttp_parser                 Parser;                   // HTTP request parser state
 		bool                         IsHttpHeaderDone = false; // Toggled once Parser tells us that it's finished parsing the header
@@ -375,7 +375,8 @@ private:
 		std::string                  HttpHeadBuf;              // Buffer of HTTP header. The parser design needs to have the entire header in memory until it's finished.
 		std::mutex                   SendLock;                 // Used by the server to ensure that only a single thread is writing to the socket at a time
 		std::string                  ChunkHead;                // Stores the most recently received chunk head
-		size_t                       ChunkReceived = 0;        // Number of bytes that we have received for the current chunk
+		size_t                       ChunkBodyReceived = 0;    // Number of bytes that we have received for the current chunk's body
+		size_t                       ChunkEndReceived  = 0;    // Number of bytes that we have received for the current chunk's end (ie \r\n). When ChunkEndReceived is 2, then the chunk is finished.
 		std::string                  OutQueue;                 // When a send() partially succeeds, then the remaining unsent bytes are placed in OutQueue. Must hold SendLock.
 		std::atomic<bool>            OutQueueHasData;          // This is synonymous with OutQueue.size() != 0. This was created so that we could avoid locking every connection in our poll() loop.
 		std::atomic<bool>            CloseWhenQueueEmpty;      // Special state for an HTTP socket that has Keep-Alive:false, and OutQueue is not empty.
