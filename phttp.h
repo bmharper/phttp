@@ -298,16 +298,19 @@ public:
 		OutBuf(const void* buf, size_t len) : Buf(buf), Len(len) {}
 	};
 
-	int                MaxConnections   = 4096; // You can raise this to 64k, but our use of poll() makes high socket numbers expensive
-	LoggerPtr          Log              = nullptr;
-	bool               LogAllEvents     = false;   // If enabled, all socket events are logged
-	bool               LogInitialListen = true;    // Log initial bind
-	phttp::Compressor* Compressor       = nullptr; // If defined, this is used by SendHttp() to compress responses
-	std::atomic<bool>  StopSignal;                 // Toggled by Stop()
+	int                MaxConnections        = 4096; // You can raise this to 64k, but our use of poll() makes high socket numbers expensive
+	LoggerPtr          Log                   = nullptr;
+	bool               LogAllEvents          = false;   // If enabled, all socket events are logged
+	bool               LogInitialListen      = true;    // Log initial bind
+	bool               RegisterSignalHandler = false;   // If true, register handler for SIGINT and SIGTERM before ListenAndRun() and stop the server if we receive either one of them. Only works on the first HTTP server created.
+	phttp::Compressor* Compressor            = nullptr; // If defined, this is used by SendHttp() to compress responses
+	std::atomic<bool>  StopSignal;                      // Toggled by Stop()
 
 	Server();
+	~Server();
 
 	// Listen and Recv until we get the stop signal.
+	// If RegisterSignalHandler is true, then we will register handlers for SIGINT and SIGTERM, and stop the server if we receive either one.
 	bool ListenAndRun(const char* bindAddress, int port, std::function<void(Response& w, RequestPtr r)> handler);
 
 	// Start listening. Use in combination with Recv() to process incoming messages.

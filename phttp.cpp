@@ -63,6 +63,7 @@ static size_t WriteV(Server::socket_t sock, const std::vector<Server::OutBuf>& b
 #else
 static const uint32_t Infinite        = 0xFFFFFFFF;
 static const int      ErrSOCKET_ERROR = -1;
+static Server*        SingleServer    = nullptr; // Used by RegisterSignalHandler
 inline int            closesocket(int fd) { return close(fd); }
 // See Windows definition for return values
 static size_t WriteV(Server::socket_t sock, const std::vector<Server::OutBuf>& buffers) {
@@ -495,6 +496,29 @@ static bool SetNonBlocking(Server::socket_t fd) {
 #endif
 }
 
+#ifndef _WIN32
+static void SigHandler(int sig, siginfo_t* siginfo, void* context) {
+	if (!SingleServer)
+		return;
+	switch (sig) {
+	case SIGINT:
+	case SIGTERM:
+		SingleServer->Stop();
+		break;
+	default:
+		break;
+	}
+}
+
+static bool RegisterSignalHandler(int sig, void (*handler)(int sig, siginfo_t* siginfo, void* context)) {
+	struct sigaction act;
+	memset(&act, 0, sizeof(act));
+	act.sa_sigaction = handler;
+	act.sa_flags     = SA_SIGINFO;
+	return sigaction(sig, &act, nullptr) == 0;
+}
+#endif
+
 Logger::~Logger() {
 }
 
@@ -504,8 +528,24 @@ FileLogger::FileLogger(FILE* target) : Target(target) {
 void FileLogger::Log(const char* msg) {
 	if (!Target)
 		return;
-	fwrite(msg, strlen(msg), 1, Target);
-	fwrite("\n", 1, 1, Target);
+	char   staticBuf[512];
+	size_t len = strlen(msg);
+	if (len + 1 <= sizeof(staticBuf)) {
+		memcpy(staticBuf, msg, len);
+		staticBuf[len] = '\n';
+		fwrite(staticBuf, len + 1, 1, Target);
+	} else {
+		char* buf = (char*) malloc(len + 1);
+		if (buf) {
+			memcpy(buf, msg, len);
+			buf[len] = '\n';
+			fwrite(buf, len + 1, 1, Target);
+			free(buf);
+		} else {
+			fwrite(msg, len, 1, Target);
+			fwrite("\n", 1, 1, Target);
+		}
+	}
 }
 
 Server::Connection::Connection(Server* owner) {
@@ -555,9 +595,23 @@ Server::Server() {
 	memset(WakePipe, 0, sizeof(WakePipe));
 }
 
+Server::~Server() {
+	if (SingleServer == this)
+		SingleServer = nullptr;
+}
+
 bool Server::ListenAndRun(const char* bindAddress, int port, std::function<void(Response& w, RequestPtr r)> handler) {
 	if (!Listen(bindAddress, port))
 		return false;
+
+	if (RegisterSignalHandler) {
+#ifndef _WIN32
+		SingleServer = this;
+		phttp::RegisterSignalHandler(SIGINT, &SigHandler);
+		phttp::RegisterSignalHandler(SIGTERM, &SigHandler);
+#endif
+	}
+
 	while (!StopSignal) {
 		vector<RequestPtr> requests = Recv();
 		for (auto r : requests) {
