@@ -596,8 +596,10 @@ Server::Server() {
 }
 
 Server::~Server() {
+#ifndef _WIN32
 	if (SingleServer == this)
 		SingleServer = nullptr;
+#endif
 }
 
 bool Server::ListenAndRun(const char* bindAddress, int port, std::function<void(Response& w, RequestPtr r)> handler) {
