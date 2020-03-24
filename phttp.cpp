@@ -265,7 +265,7 @@ Request::~Request() {
 	delete ud;
 }
 
-std::shared_ptr<Request> Request::MockRequest(const std::string& method, const std::string& path, std::initializer_list<std::pair<std::string, std::string>> queryParams, const std::string& body) {
+std::shared_ptr<Request> Request::MockRequest(const std::string& method, const std::string& path, std::vector<std::pair<std::string, std::string>> queryParams, const std::string& body) {
 	auto r              = make_shared<Request>(nullptr, 0, RequestType::Http);
 	r->Version          = "HTTP/1.1";
 	r->Path             = path;

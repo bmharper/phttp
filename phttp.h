@@ -172,7 +172,7 @@ public:
 	~Request();
 
 	// Helper function to create a mocked request, for use in unit tests
-	static std::shared_ptr<Request> MockRequest(const std::string& method, const std::string& path, std::initializer_list<std::pair<std::string, std::string>> queryParams = {}, const std::string& body = "");
+	static std::shared_ptr<Request> MockRequest(const std::string& method, const std::string& path, std::vector<std::pair<std::string, std::string>> queryParams = {}, const std::string& body = "");
 
 	std::string        Header(const char* h) const;                                         // Returns first header found, or empty string. Header name match is case-insensitive
 	std::string        QueryVal(const char* key) const;                                     // Returns first value found, or empty string
