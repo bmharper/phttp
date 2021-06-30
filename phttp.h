@@ -154,7 +154,7 @@ public:
 	phttp::Server*                Server        = nullptr;
 	RequestType                   Type          = RequestType::Null;
 	size_t                        ContentLength = 0;     // Parsed from the Content-Length header
-	int64_t                       ConnectionID  = 0;     // ID of the socket connection (but not literally the socket fd).
+	int64_t                       ConnectionID  = 0;     // ID of the socket connection (but not literally the socket fd). Uniquely represents HTTP Request/Response pair, or WebSocket connection.
 	bool                          IsChunked     = false; // True if this is a chunked request
 	std::string                   Version;               // "HTTP/1.0" or "HTTP/1.1"
 	StrPairList                   Headers;               // Headers
