@@ -25,7 +25,7 @@
 #pragma warning(disable : 4996) // sprintf
 #endif
 
-typedef unsigned char byte;
+typedef unsigned char byte_t;
 using namespace std;
 
 namespace phttp {
@@ -951,7 +951,7 @@ bool Server::ReadFromWebSocket(Connection* c, RequestPtr& r) {
 	// we have an incomplete header. The maximum size of a header is 14
 	// bytes, so if we haven't made progress, and we have 14 bytes or
 	// more inside our buffer, then we have a bug.
-	byte* prevBufStart = RecvBufStart - 1;
+	byte_t* prevBufStart = RecvBufStart - 1;
 	while (RecvBufStart != prevBufStart) {
 		prevBufStart = RecvBufStart;
 		if (!ReadFromWebSocketLoop(c, r))
@@ -1040,7 +1040,7 @@ bool Server::ReadWebSocketHead(Connection* c) {
 	// To simplify this code, we always work off a static buffer of 14 bytes.
 	// Not all 14 bytes are necessarily populated.
 
-	byte   buf[14];
+	byte_t buf[14];
 	size_t extraBytes = std::min(RecvBufLen(), 14 - c->WebSockHeadBufLen);
 	memcpy(buf, c->WebSockHeadBuf, c->WebSockHeadBufLen);
 	memcpy(buf + c->WebSockHeadBufLen, RecvBufStart, extraBytes);
@@ -1051,9 +1051,9 @@ bool Server::ReadWebSocketHead(Connection* c) {
 		return true;
 
 	c->IsWebSocketFin = !!(buf[0] & 128);
-	c->WebSockType    = (WebSocketFrameType)(buf[0] & 15);
+	c->WebSockType    = (WebSocketFrameType) (buf[0] & 15);
 
-	byte len1 = buf[1];
+	byte_t len1 = buf[1];
 	if (!(len1 & 128)) {
 		WriteLog("[%5lld %5d] websocket client didn't mask request", (long long) c->ID, (int) c->Sock);
 		return false;
@@ -1516,26 +1516,26 @@ bool Server::TransmitWebSocket(bool ensureSingleCaller, int64_t connectionID, Re
 		return true;
 	}
 
-	byte  head[10];
-	byte* h = head;
-	*h++    = 0x80 | (byte) ft;
+	byte_t  head[10];
+	byte_t* h = head;
+	*h++      = 0x80 | (byte_t) ft;
 	if (len < 126) {
-		*h++ = (byte) len;
+		*h++ = (byte_t) len;
 	} else if (len < 65536) {
 		*h++ = 126;
-		*h++ = (byte)(len >> 8);
-		*h++ = (byte) len;
+		*h++ = (byte_t) (len >> 8);
+		*h++ = (byte_t) len;
 	} else {
 		uint64_t len64 = len;
 		*h++           = 127;
-		*h++           = (byte)(len64 >> 56);
-		*h++           = (byte)(len64 >> 48);
-		*h++           = (byte)(len64 >> 40);
-		*h++           = (byte)(len64 >> 32);
-		*h++           = (byte)(len64 >> 24);
-		*h++           = (byte)(len64 >> 16);
-		*h++           = (byte)(len64 >> 8);
-		*h++           = (byte) len64;
+		*h++           = (byte_t) (len64 >> 56);
+		*h++           = (byte_t) (len64 >> 48);
+		*h++           = (byte_t) (len64 >> 40);
+		*h++           = (byte_t) (len64 >> 32);
+		*h++           = (byte_t) (len64 >> 24);
+		*h++           = (byte_t) (len64 >> 16);
+		*h++           = (byte_t) (len64 >> 8);
+		*h++           = (byte_t) len64;
 	}
 
 	vector<OutBuf> buffers;
@@ -1557,10 +1557,10 @@ bool Server::TransmitWebSocket(bool ensureSingleCaller, int64_t connectionID, Re
 }
 
 void Server::CloseWebSocket(int64_t connectionID, WebSocketCloseReason reason, const void* message, size_t messageLen) {
-	byte     code[2];
+	byte_t   code[2];
 	uint16_t r16 = (uint16_t) reason;
-	code[0]      = (byte)(r16 >> 8);
-	code[1]      = (byte)(r16);
+	code[0]      = (byte_t) (r16 >> 8);
+	code[1]      = (byte_t) (r16);
 	string wbuf;
 	wbuf.append((const char*) code, 2);
 	if (message)
@@ -1589,13 +1589,13 @@ size_t Server::SendCapacity(int64_t connectionID) {
 void Server::_UnmaskBuffer(uint8_t* buf, size_t bufLen, uint8_t* mask, uint32_t& maskPos) {
 	uint32_t mp = maskPos & 3;
 
-	byte* bufEnd = buf + bufLen;
+	byte_t* bufEnd = buf + bufLen;
 
 	// process until rbuf is 4 byte aligned
 	for (; ((size_t) buf & 3) != 0 && buf < bufEnd; buf++, mp = (mp + 1) & 3)
 		*buf ^= mask[mp];
 
-	byte* bufEndDown4 = (byte*) (((size_t) bufEnd) & ~3);
+	byte_t* bufEndDown4 = (byte_t*) (((size_t) bufEnd) & ~3);
 	// unmask in 4 byte chunks
 	uint32_t mask32 = 0;
 	mask32          = (mask32 << 8) | mask[(mp + 3) & 3];
